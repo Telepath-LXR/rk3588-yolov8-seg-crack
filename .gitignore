@@ -1,0 +1,83 @@
+# ============================================================
+# .gitignore — YOLOv8-seg RK3588 零拷贝部署项目
+# ============================================================
+# 策略: 源码/脚本/文档/数据集/评测结果纳入版本;
+#       二进制模型 (仅留最终交付 yolo8n_int8_cut.rknn)、
+#       归档/备份/构建产物/缓存 全部忽略.
+
+# ---- 构建产物 (交叉编译) ----
+*.o
+*.obj
+rknn_seg_zc
+probe_zero_copy
+*.elf
+*.so
+*.a
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# ---- 模型二进制 (大文件, 用 release 附件/git-lfs 管理) ----
+# 最终交付 yolo8n_int8_cut.rknn (4.5MB) 例外保留, 见下方 ! 规则.
+*.onnx
+*.onnx.bak
+*.bak
+*.bak_*
+*.pt
+*.pth
+*.tar
+# 旧/失败/对照 .rknn (仅保留最终 INT8 交付物)
+crack_seg.rknn
+crack_seg_fp16.rknn
+yolo8n_fp16.rknn
+yolo8n_int8.rknn
+yolo8n_int8_v2.rknn
+yolo8n_int8_hybrid.rknn
+yolo8n_fp16_cut.rknn
+yolo8n_int8_cut.rknn.bak_broken_proto
+
+# ---- 训练中间产物 (seg/ 内的大文件) ----
+seg/weights/*.onnx
+seg/weights/*.pt
+seg/train_batch*.jpg
+seg/val_batch*.jpg
+
+# ---- 数据集缓存 ----
+datasets/**/val.cache
+datasets/**/test.cache
+datasets/**/train.cache
+
+# ---- 评测中间产物 (eval_failures 是 eval 模式每跑一次重新生成的) ----
+eval_failures/
+
+# ---- 临时/调试输出 ----
+*.png.bak
+cmp_*_out.png
+cut_verify.png
+result.jpg
+test.jpg
+*.log
+*.tmp
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+
+# ---- Claude 本地设置 ----
+.claude/settings.local.json
+
+# ---- 最终交付模型: 例外保留 (4.5MB, 让招聘方能直接跑) ----
+!yolo8n_int8_cut.rknn
