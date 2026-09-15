@@ -1,0 +1,65 @@
+============================================================
+  RKNN 板端性能报告  |  模型: INT8 (./yolo8n_int8_cut.rknn)
+  生成时间: 2026-09-14 16:29:10
+============================================================
+
+[模型规格]
+  类型:           INT8
+  文件大小:       4.55 MB
+  SDK 版本:       ==============================================
+RKNN VERSION:
+  API: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+  DRV: 0.9.8
+==============================================
+
+  输入/输出:      1 / 10
+  输出张量:
+    out0  [1, 64, 80, 80]        int8 Conv_output_0      scale=0.3987962305545807 zp=-7
+    out1  [1, 1, 80, 80]         int8 Conv_output_0      scale=0.0903453454375267 zp=127
+    out2  [1, 32, 80, 80]        int8 Conv_output_0      scale=0.2268494963645935 zp=36
+    out3  [1, 64, 40, 40]        int8 Conv_output_0      scale=0.882546603679657 zp=-45
+    out4  [1, 1, 40, 40]         int8 Conv_output_0      scale=0.14042465388774872 zp=124
+    out5  [1, 32, 40, 40]        int8 Conv_output_0      scale=0.05804528295993805 zp=32
+    out6  [1, 64, 20, 20]        int8 Conv_output_0      scale=0.2880500853061676 zp=-46
+    out7  [1, 1, 20, 20]         int8 Conv_output_0      scale=0.20754173398017883 zp=116
+    out8  [1, 32, 20, 20]        int8 Conv_output_0      scale=0.019512074068188667 zp=23
+    out9  [1, 32, 160, 160]      int8 Conv_output_0      scale=0.17353510856628418 zp=30
+
+[运行概况]
+  输入源:         /dev/video44
+  运行时长:       35.6 s
+  总帧数:         441
+  实测 FPS:       12.39
+  推理 infer:  mean= 30.39  p50= 29.93  p95= 35.69  min= 21.65  max= 45.17 ms  (n=441)
+  后处理 post:  mean= 22.53  p50= 23.71  p95= 38.59  min=  7.61  max= 44.60 ms  (n=441)
+  端到端 e2e:  mean= 52.92  p50= 55.65  p95= 71.01  min= 29.83  max= 78.81 ms  (n=441)
+
+[检测效果]
+  命中帧数:       249 / 441 (56.5%)
+  平均目标数:     0.85
+  平均最高置信度: 0.384
+  平均掩码像素:   9428
+
+[硬件指标] (后台每秒采样)
+  NPU core0 负载:  mean= 17.8%  peak= 29.0%
+  NPU core1 负载:  mean=  1.6%  peak=  3.0%
+  NPU core2 负载:  mean=  1.6%  peak=  3.0%
+  NPU 频率        mean= 1000.0  peak= 1000.0 MHz
+  GPU 频率        mean=  300.0  peak=  300.0 MHz
+  DDR 频率        mean= 1560.0  peak= 1560.0 MHz
+  温度 bigcore1-thermal mean= 39.4  peak= 41.6 C
+  温度 soc-thermal    mean= 39.3  peak= 40.7 C
+  温度 gpu-thermal    mean= 37.5  peak= 38.8 C
+  温度 littlecore-thermal mean= 39.5  peak= 41.6 C
+  温度 bigcore0-thermal mean= 39.3  peak= 41.6 C
+  温度 npu-thermal    mean= 38.2  peak= 39.8 C
+  温度 center-thermal mean= 38.0  peak= 39.8 C
+  进程 RSS:       mean=  233.7  peak=  267.9 MB
+  系统可用内存:   mean= 7079.1  peak= 7218.6 MB
+  模型内存占用:
+    system_memory  最大=0  总计=0
+    npu_memory     最大=0  总计=0
+    total_memory   最大=0  总计=0
+  rknn 单帧耗时(get_run_perf): mean=17607 us
+
+============================================================

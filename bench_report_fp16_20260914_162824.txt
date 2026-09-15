@@ -1,0 +1,65 @@
+============================================================
+  RKNN 板端性能报告  |  模型: FP16 (./yolo8n_fp16_cut.rknn)
+  生成时间: 2026-09-14 16:28:24
+============================================================
+
+[模型规格]
+  类型:           FP16
+  文件大小:       7.99 MB
+  SDK 版本:       ==============================================
+RKNN VERSION:
+  API: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+  DRV: 0.9.8
+==============================================
+
+  输入/输出:      1 / 10
+  输出张量:
+    out0  [1, 64, 80, 80]        float16 Conv_output_0      scale=1.0 zp=0
+    out1  [1, 1, 80, 80]         float16 Conv_output_0      scale=1.0 zp=0
+    out2  [1, 32, 80, 80]        float16 Conv_output_0      scale=1.0 zp=0
+    out3  [1, 64, 40, 40]        float16 Conv_output_0      scale=1.0 zp=0
+    out4  [1, 1, 40, 40]         float16 Conv_output_0      scale=1.0 zp=0
+    out5  [1, 32, 40, 40]        float16 Conv_output_0      scale=1.0 zp=0
+    out6  [1, 64, 20, 20]        float16 Conv_output_0      scale=1.0 zp=0
+    out7  [1, 1, 20, 20]         float16 Conv_output_0      scale=1.0 zp=0
+    out8  [1, 32, 20, 20]        float16 Conv_output_0      scale=1.0 zp=0
+    out9  [1, 32, 160, 160]      float16 Conv_output_0      scale=1.0 zp=0
+
+[运行概况]
+  输入源:         /dev/video44
+  运行时长:       27.9 s
+  总帧数:         219
+  实测 FPS:       7.84
+  推理 infer:  mean= 86.45  p50= 90.30  p95=103.60  min= 53.17  max=105.46 ms  (n=219)
+  后处理 post:  mean= 15.49  p50= 14.82  p95= 26.27  min=  7.49  max= 42.86 ms  (n=219)
+  端到端 e2e:  mean=101.94  p50=104.83  p95=122.75  min= 64.28  max=133.47 ms  (n=219)
+
+[检测效果]
+  命中帧数:       177 / 219 (80.8%)
+  平均目标数:     1.12
+  平均最高置信度: 0.483
+  平均掩码像素:   11888
+
+[硬件指标] (后台每秒采样)
+  NPU core0 负载:  mean= 24.2%  peak= 31.0%
+  NPU core1 负载:  mean=  1.8%  peak=  2.0%
+  NPU core2 负载:  mean=  1.9%  peak=  2.0%
+  NPU 频率        mean= 1000.0  peak= 1000.0 MHz
+  GPU 频率        mean=  300.0  peak=  300.0 MHz
+  DDR 频率        mean= 1560.0  peak= 1560.0 MHz
+  温度 bigcore1-thermal mean= 37.5  peak= 38.8 C
+  温度 soc-thermal    mean= 37.5  peak= 38.8 C
+  温度 gpu-thermal    mean= 36.0  peak= 37.0 C
+  温度 littlecore-thermal mean= 37.6  peak= 38.8 C
+  温度 bigcore0-thermal mean= 37.5  peak= 38.8 C
+  温度 npu-thermal    mean= 36.7  peak= 37.9 C
+  温度 center-thermal mean= 36.5  peak= 37.9 C
+  进程 RSS:       mean=  241.1  peak=  269.9 MB
+  系统可用内存:   mean= 7074.5  peak= 7217.4 MB
+  模型内存占用:
+    system_memory  最大=0  总计=0
+    npu_memory     最大=0  总计=0
+    total_memory   最大=0  总计=0
+  rknn 单帧耗时(get_run_perf): mean=35626 us
+
+============================================================

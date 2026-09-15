@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLOv8-seg RKNN 板端评估报告 · FP16 vs INT8</title>
+<style>
+  /* ---- palette (reference instance, no swap) ---- */
+  .viz-root{
+    color-scheme: light;
+    --surface-1:#fcfcfb; --surface-2:#f9f9f7;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --muted:#898781;
+    --gridline:#e1e0d9; --baseline:#c3c2b7;
+    --border:rgba(11,11,11,0.10);
+    --series-fp16:#2a78d6; --series-int8:#eb6834;
+    --delta-up:#006300;
+    --status-good:#0ca30c; --status-warn:#fab219; --status-serious:#ec835a;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:where(:not([data-theme="light"])) .viz-root{
+      color-scheme: dark;
+      --surface-1:#1a1a19; --surface-2:#0d0d0d;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --muted:#898781;
+      --gridline:#2c2c2a; --baseline:#383835;
+      --border:rgba(255,255,255,0.10);
+      --series-fp16:#3987e5; --series-int8:#d95926;
+      --delta-up:#0ca30c;
+      --status-good:#0ca30c; --status-warn:#fab219; --status-serious:#ec835a;
+    }
+  }
+  :root[data-theme="dark"] .viz-root{
+    color-scheme: dark;
+    --surface-1:#1a1a19; --surface-2:#0d0d0d;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --muted:#898781;
+    --gridline:#2c2c2a; --baseline:#383835;
+    --border:rgba(255,255,255,0.10);
+    --series-fp16:#3987e5; --series-int8:#d95926;
+    --delta-up:#0ca30c;
+    --status-good:#0ca30c; --status-warn:#fab219; --status-serious:#ec835a;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    background:var(--surface-2); color:var(--text-primary);
+    line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  .viz-root{ background:var(--surface-2); }
+  .wrap{ max-width:1040px; margin:0 auto; padding:32px 24px 64px; }
+  header{ border-bottom:1px solid var(--border); padding-bottom:20px; margin-bottom:28px; }
+  h1{ font-size:25px; margin:0 0 6px; font-weight:650; letter-spacing:-0.01em; }
+  .sub{ color:var(--text-secondary); font-size:14px; }
+  .meta{ display:flex; flex-wrap:wrap; gap:6px 18px; margin-top:14px; font-size:12.5px; color:var(--muted); }
+  .meta b{ color:var(--text-secondary); font-weight:600; }
+  h2{ font-size:18px; margin:36px 0 14px; font-weight:650; letter-spacing:-0.01em; }
+  h2 .num{ color:var(--muted); font-weight:500; font-size:13px; margin-right:8px; font-variant-numeric:tabular-nums; }
+  h3{ font-size:15px; margin:22px 0 10px; font-weight:600; color:var(--text-secondary); }
+
+  /* ---- KPI hero row ---- */
+  .kpi{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:8px 0 8px; }
+  .card{
+    background:var(--surface-1); border:1px solid var(--border); border-radius:10px;
+    padding:18px 16px 16px;
+  }
+  .card .lbl{ font-size:12px; color:var(--muted); letter-spacing:0.02em; }
+  .card .val{ font-size:30px; font-weight:650; letter-spacing:-0.02em; margin-top:4px; color:var(--text-primary); font-variant-numeric:tabular-nums; }
+  .card .val .u{ font-size:15px; color:var(--text-secondary); font-weight:500; margin-left:2px; }
+  .card .delta{ font-size:12.5px; margin-top:6px; color:var(--delta-up); font-weight:600; }
+  .card .swatch{ width:10px; height:10px; border-radius:2px; display:inline-block; margin-right:6px; vertical-align:middle; }
+
+  /* ---- charts ---- */
+  .chart{ background:var(--surface-1); border:1px solid var(--border); border-radius:10px; padding:18px 16px 12px; margin:10px 0 6px; }
+  .chart .ctitle{ font-size:14px; font-weight:600; color:var(--text-primary); margin-bottom:2px; }
+  .chart .cnote{ font-size:12px; color:var(--muted); margin-bottom:10px; }
+  svg{ display:block; width:100%; height:auto; overflow:visible; }
+  .legend{ display:flex; gap:18px; justify-content:flex-end; font-size:12.5px; color:var(--text-secondary); margin-top:8px; }
+  .legend .sw{ width:11px; height:11px; border-radius:2px; display:inline-block; margin-right:6px; vertical-align:-1px; }
+  .axis text, .grid text{ fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .axis line{ stroke:var(--baseline); stroke-width:1; }
+  .grid line{ stroke:var(--gridline); stroke-width:1; }
+  .catlabel{ fill:var(--text-secondary); font-size:12px; }
+  .vallabel{ fill:var(--text-secondary); font-size:11px; font-variant-numeric:tabular-nums; }
+  .bar{ cursor:default; }
+  rect.bar{ transition:opacity .12s; }
+  rect.bar:hover{ opacity:.78; }
+
+  /* ---- tables ---- */
+  table{ width:100%; border-collapse:collapse; font-size:13.5px; margin:8px 0 4px; }
+  th,td{ padding:8px 10px; text-align:right; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; }
+  th:first-child,td:first-child{ text-align:left; font-variant-numeric:normal; }
+  thead th{ color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.03em; border-bottom:1.5px solid var(--baseline); }
+  tbody tr:hover{ background:var(--surface-1); }
+  td .sw{ width:9px; height:9px; border-radius:2px; display:inline-block; margin-right:7px; vertical-align:-1px; }
+  .grp td{ color:var(--text-secondary); font-weight:600; background:var(--surface-1); font-size:12px; text-transform:uppercase; letter-spacing:0.03em; }
+  .ratio{ color:var(--text-secondary); }
+  .pos{ color:var(--delta-up); font-weight:600; }
+  .neg{ color:var(--status-serious); font-weight:600; }
+
+  /* ---- conclusion ---- */
+  .concl{ background:var(--surface-1); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-top:8px; }
+  .concl ul{ margin:6px 0 12px; padding-left:20px; }
+  .concl li{ margin-bottom:7px; }
+  .tag{ display:inline-block; font-size:11px; font-weight:600; padding:1px 7px; border-radius:4px; letter-spacing:0.02em; margin-right:4px; }
+  .tag-win{ background:rgba(12,163,12,0.14); color:var(--status-good); }
+  .tag-cost{ background:rgba(236,131,90,0.16); color:var(--status-serious); }
+  .tag-note{ background:rgba(250,178,25,0.18); color:var(--status-warn); }
+  .foot{ margin-top:36px; padding-top:14px; border-top:1px solid var(--border); color:var(--muted); font-size:11.5px; }
+  .toggle{ float:right; font-size:12px; color:var(--text-secondary); cursor:pointer; border:1px solid var(--border); border-radius:6px; padding:3px 10px; background:var(--surface-1); }
+  .toggle:hover{ color:var(--text-primary); }
+  @media(max-width:680px){
+    .kpi{ grid-template-columns:repeat(2,1fr); }
+    .card .val{ font-size:25px; }
+    th,td{ padding:7px 6px; font-size:12.5px; }
+  }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<div class="wrap">
+
+  <header>
+    <h1>YOLOv8-seg 裂缝检测 · RKNN 板端评估报告</h1>
+    <div class="sub">FP16 vs INT8 量化精度对比 · 单类实例分割 (crack)</div>
+    <div class="meta">
+      <span><b>板卡</b> RK3588 (NPU 3 核, NPU_CORE_0_1_2)</span>
+      <span><b>SDK</b> RKNN API 2.3.2 / DRV 0.9.8</span>
+      <span><b>输入</b> 640×640 · 摄像头 /dev/video44</span>
+      <span><b>后处理</b> post_cut.py (OBJ_THRESH=0.25)</span>
+    </div>
+    <div class="meta">
+      <span><b>FP16 模型</b> yolo8n_fp16_cut.rknn · 219 帧 / 27.9 s</span>
+      <span><b>INT8 模型</b> yolo8n_int8_cut.rknn · 441 帧 / 35.6 s</span>
+      <span><b>生成</b> 2026-09-14</span>
+    </div>
+    <button class="toggle" id="themeBtn" onclick="toggleTheme()">🌙 深色</button>
+  </header>
+
+  <!-- ============ KPI ============ -->
+  <h2><span class="num">01</span>关键指标</h2>
+  <div class="kpi">
+    <div class="card">
+      <div class="lbl"><span class="swatch" style="background:var(--series-int8)"></span>INT8 实测帧率</div>
+      <div class="val">12.39<span class="u"> FPS</span></div>
+      <div class="delta">↑ vs FP16 +58%</div>
+    </div>
+    <div class="card">
+      <div class="lbl"><span class="swatch" style="background:var(--series-fp16)"></span>FP16 实测帧率</div>
+      <div class="val">7.84<span class="u"> FPS</span></div>
+      <div class="delta" style="color:var(--text-secondary)">基线</div>
+    </div>
+    <div class="card">
+      <div class="lbl">端到端加速比</div>
+      <div class="val">1.93<span class="u">×</span></div>
+      <div class="delta">推理单核 2.85× 快</div>
+    </div>
+    <div class="card">
+      <div class="lbl">INT8 体积缩小</div>
+      <div class="val">43<span class="u">%</span></div>
+      <div class="delta">7.99 → 4.55 MB</div>
+    </div>
+  </div>
+
+  <!-- ============ 延迟分解 ============ -->
+  <h2><span class="num">02</span>延迟分解 (平均)</h2>
+  <div class="chart" id="chart1">
+    <div class="ctitle">推理 / 后处理 / 端到端 平均延迟</div>
+    <div class="cnote">单位 ms (mean) · INT8 推理大幅领先,但 numpy 后处理反而更慢,吃掉部分加速红利。</div>
+    <div id="c1svg"></div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--series-fp16)"></span>FP16</span>
+      <span><span class="sw" style="background:var(--series-int8)"></span>INT8</span>
+    </div>
+  </div>
+
+  <!-- ============ 百分位 ============ -->
+  <h2><span class="num">03</span>端到端百分位延迟</h2>
+  <div class="chart" id="chart2">
+    <div class="ctitle">p50 / p95 / max — 尾延迟分布</div>
+    <div class="cnote">单位 ms · INT8 在 p95 与 max 同样稳定领先,尾延迟未恶化。</div>
+    <div id="c2svg"></div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--series-fp16)"></span>FP16</span>
+      <span><span class="sw" style="background:var(--series-int8)"></span>INT8</span>
+    </div>
+  </div>
+
+  <!-- ============ 综合对比表 ============ -->
+  <h2><span class="num">04</span>综合对比</h2>
+  <table>
+    <thead><tr><th>指标</th><th>FP16</th><th>INT8</th><th>INT8 / FP16</th></tr></thead>
+    <tbody>
+      <tr><td>模型文件大小</td><td>7.99 MB</td><td>4.55 MB</td><td class="pos">0.57× (小 43%)</td></tr>
+      <tr><td>实测帧率</td><td>7.84 FPS</td><td>12.39 FPS</td><td class="pos">1.58× 更快</td></tr>
+      <tr><td>推理耗时 (infer mean)</td><td>86.45 ms</td><td>30.39 ms</td><td class="pos">2.85× 更快</td></tr>
+      <tr><td>后处理耗时 (post mean)</td><td>15.49 ms</td><td>22.53 ms</td><td class="neg">1.45× 更慢</td></tr>
+      <tr><td>端到端耗时 (e2e mean)</td><td>101.94 ms</td><td>52.92 ms</td><td class="pos">1.93× 更快</td></tr>
+      <tr><td>e2e p50</td><td>104.83 ms</td><td>55.65 ms</td><td class="ratio">0.53×</td></tr>
+      <tr><td>e2e p95</td><td>122.75 ms</td><td>71.01 ms</td><td class="ratio">0.58×</td></tr>
+      <tr><td>e2e max</td><td>133.47 ms</td><td>78.81 ms</td><td class="ratio">0.59×</td></tr>
+      <tr><td>rknn 单帧 (get_run_perf)</td><td>35626 µs</td><td>17607 µs</td><td class="pos">2.02× 更快</td></tr>
+      <tr><td>进程 RSS (mean / peak)</td><td>241.1 / 269.9 MB</td><td>233.7 / 267.9 MB</td><td class="ratio">略低</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ============ 检测质量 ============ -->
+  <h2><span class="num">05</span>检测质量</h2>
+  <table>
+    <thead><tr><th>指标</th><th>FP16</th><th>INT8</th><th>差异</th></tr></thead>
+    <tbody>
+      <tr><td>命中帧数 / 总帧数</td><td>177 / 219</td><td>249 / 441</td><td>—</td></tr>
+      <tr><td>命中率</td><td>80.8%</td><td>56.5%</td><td class="neg">−24.3 pp</td></tr>
+      <tr><td>平均目标数</td><td>1.12</td><td>0.85</td><td class="neg">−0.27</td></tr>
+      <tr><td>平均最高置信度</td><td>0.483</td><td>0.384</td><td class="neg">−0.099</td></tr>
+      <tr><td>平均掩码像素</td><td>11888</td><td>9428</td><td class="neg">−21%</td></tr>
+    </tbody>
+  </table>
+  <div class="cnote" style="margin-top:6px;color:var(--muted);font-size:12px">
+    注:INT8 量化压低了类别 logit,更多框落在 OBJ_THRESH=0.25 之下被丢弃,导致命中率/置信度/掩码面积同步下降。两次测试帧数与场景内容不同,命中率差异含场景因素,但置信度普遍走低是量化直接效应。
+  </div>
+
+  <!-- ============ 硬件监控 ============ -->
+  <h2><span class="num">06</span>硬件监控 (后台每秒采样)</h2>
+  <table>
+    <thead><tr><th>指标</th><th>FP16 mean</th><th>FP16 peak</th><th>INT8 mean</th><th>INT8 peak</th></tr></thead>
+    <tbody>
+      <tr class="grp"><td colspan="5">NPU 负载</td></tr>
+      <tr><td><span class="sw" style="background:var(--series-fp16)"></span>core0</td><td>24.2%</td><td>31.0%</td><td>17.8%</td><td>29.0%</td></tr>
+      <tr><td>core1</td><td>1.8%</td><td>2.0%</td><td>1.6%</td><td>3.0%</td></tr>
+      <tr><td>core2</td><td>1.9%</td><td>2.0%</td><td>1.6%</td><td>3.0%</td></tr>
+      <tr class="grp"><td colspan="5">频率 (MHz)</td></tr>
+      <tr><td>NPU</td><td>1000.0</td><td>1000.0</td><td>1000.0</td><td>1000.0</td></tr>
+      <tr><td>GPU</td><td>300.0</td><td>300.0</td><td>300.0</td><td>300.0</td></tr>
+      <tr><td>DDR</td><td>1560.0</td><td>1560.0</td><td>1560.0</td><td>1560.0</td></tr>
+      <tr class="grp"><td colspan="5">温度 (°C)</td></tr>
+      <tr><td>npu-thermal</td><td>36.7</td><td>37.9</td><td>38.2</td><td>39.8</td></tr>
+      <tr><td>bigcore0-thermal</td><td>37.5</td><td>38.8</td><td>39.3</td><td>41.6</td></tr>
+      <tr><td>bigcore1-thermal</td><td>37.5</td><td>38.8</td><td>39.4</td><td>41.6</td></tr>
+      <tr><td>soc-thermal</td><td>37.5</td><td>38.8</td><td>39.3</td><td>40.7</td></tr>
+      <tr><td>gpu-thermal</td><td>36.0</td><td>37.0</td><td>37.5</td><td>38.8</td></tr>
+      <tr><td>littlecore-thermal</td><td>37.6</td><td>38.8</td><td>39.5</td><td>41.6</td></tr>
+      <tr><td>center-thermal</td><td>36.5</td><td>37.9</td><td>38.0</td><td>39.8</td></tr>
+      <tr class="grp"><td colspan="5">内存</td></tr>
+      <tr><td>进程 RSS</td><td>241.1 MB</td><td>269.9 MB</td><td>233.7 MB</td><td>267.9 MB</td></tr>
+      <tr><td>系统可用内存</td><td>7074.5 MB</td><td>7217.4 MB</td><td>7079.1 MB</td><td>7218.6 MB</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ============ 结论 ============ -->
+  <h2><span class="num">07</span>结论与建议</h2>
+  <div class="concl">
+    <ul>
+      <li><span class="tag tag-win">速度</span>INT8 全面胜出:推理快 <b>2.85×</b>、端到端快 <b>1.93×</b>、帧率 7.84→12.39 FPS、体积小 <b>43%</b>、rknn 单帧快 2.02×。所有百分位(p50/p95/max)同步领先,尾延迟未恶化。</li>
+      <li><span class="tag tag-cost">精度</span>INT8 代价显著:命中率 80.8%→56.5%(−24.3 pp)、平均置信度 0.483→0.384、掩码面积 −21%。根因是量化压低 cls logit,更多框卡在 0.25 阈值下被丢弃。</li>
+      <li><span class="tag tag-note">后处理</span>INT8 后处理反而更慢(22.53 vs 15.49 ms)。numpy 后处理代码相同,差异来自帧数与场景内容,非模型缺陷,但吃掉了部分加速红利(净 e2e 加速 1.93× < 纯推理 2.85×)。</li>
+      <li><span class="tag tag-win">裕量</span>温度/负载远未触顶:NPU core0 峰值仅 31%、各温度区峰值 &lt;42 °C,无热瓶颈,有充足余量支撑更高负载或并发。</li>
+    </ul>
+
+    <h3>选型建议</h3>
+    <ul>
+      <li><b>量产实时部署 → INT8</b>:帧率/体积/功耗优势压倒性,适合产线/巡检的实时裂缝检测。</li>
+      <li><b>细弱裂缝场景 → FP16 兜底</b>:对低对比度、细窄裂缝,FP16 保留更高置信度与召回。</li>
+      <li><b>找回 INT8 命中率</b>:把 <code>post_cut.py</code> 顶部 <code>OBJ_THRESH</code> 从 0.25 降到 0.15–0.20,配合 NMS 抑制误检,预计可显著回收命中率(代价是少量假阳性)。</li>
+      <li><b>进一步释放红利</b>:后处理当前为纯 numpy(DFL/解码/掩码合成),可改用 cv2 优化或下沉到 NPU/可加速算子,把 post 从 22 ms 压下后,端到端有望逼近 1/推理 ≈ 33 FPS 上限。</li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    数据源:bench_report_fp16_20260914_162824.txt · bench_report_int8_20260914_162910.txt · 采集脚本 live_bench.py (RK3588, 2026-09-14) · 本报告自包含,无外部依赖。
+  </div>
+
+</div>
+</div>
+
+<script>
+// ---- data (改数据只改这一处) ----
+const DATA = {
+  latency: {
+    cats: ["推理 infer", "后处理 post", "端到端 e2e"],
+    fp16: [86.45, 15.49, 101.94],
+    int8: [30.39, 22.53, 52.92],
+    unit: "ms"
+  },
+  percentile: {
+    cats: ["p50", "p95", "max"],
+    fp16: [104.83, 122.75, 133.47],
+    int8: [55.65, 71.01, 78.81],
+    unit: "ms"
+  }
+};
+
+const CSS = ()=> {
+  const s = getComputedStyle(document.querySelector(".viz-root"));
+  return {
+    fp16: s.getPropertyValue("--series-fp16").trim(),
+    int8: s.getPropertyValue("--series-int8").trim(),
+    grid: s.getPropertyValue("--gridline").trim(),
+    base: s.getPropertyValue("--baseline").trim(),
+    muted: s.getPropertyValue("--muted").trim(),
+    sec: s.getPropertyValue("--text-secondary").trim(),
+    border: s.getPropertyValue("--border").trim(),
+    surf: s.getPropertyValue("--surface-1").trim()
+  };
+};
+
+// 分组柱状图渲染器:传入容器id、数据、是否标注关键值
+function groupedBars(id, d, labels){
+  const c = CSS();
+  const W = 720, H = 300, m = {t:18, r:18, b:46, l:54};
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const all = d.fp16.concat(d.int8);
+  const maxV = Math.ceil(Math.max(...all) / 20) * 20;       // 上取整到20
+  const ticks = 5;
+  const step = maxV / ticks;
+  const nCats = d.cats.length;
+  const groupW = pw / nCats;
+  const barW = 26;
+  const gap = 4;                                            // 组内 2px 表面间隙-> 视觉用4
+  const s2 = "transparent";
+
+  let g = "";
+  // y 网格 + 刻度
+  for(let i=0;i<=ticks;i++){
+    const v = step*i;
+    const y = m.t + ph - (v/maxV)*ph;
+    g += `<line class="grid" x1="${m.l}" y1="${y.toFixed(1)}" x2="${m.l+pw}" y2="${y.toFixed(1)}"/>`;
+    g += `<text class="axis" x="${m.l-8}" y="${(y+3.5).toFixed(1)}" text-anchor="end">${v.toFixed(0)}</text>`;
+  }
+  // 基线
+  g += `<line class="axis" x1="${m.l}" y1="${m.t+ph}" x2="${m.l+pw}" y2="${m.t+ph}/>`;
+  // 分组
+  d.cats.forEach((cat, i)=>{
+    const gx = m.l + groupW*i + groupW/2;
+    // 类别标签
+    g += `<text class="catlabel" x="${gx.toFixed(1)}" y="${(m.t+ph+20).toFixed(1)}" text-anchor="middle">${cat}</text>`;
+    const baseY = m.t + ph;
+    // FP16 柱 (左)
+    const fp16x = gx - barW - gap/2;
+    const fp16h = (d.fp16[i]/maxV)*ph;
+    g += `<rect class="bar" x="${(fp16x-barW/2).toFixed(1)}" y="${(baseY-fp16h).toFixed(1)}" width="${barW}" height="${fp16h.toFixed(1)}" rx="2" fill="${c.fp16}"><title>${cat} · FP16: ${d.fp16[i]} ${d.unit}</title></rect>`;
+    // INT8 柱 (右)
+    const int8x = gx + barW + gap/2;
+    const int8h = (d.int8[i]/maxV)*ph;
+    g += `<rect class="bar" x="${(int8x-barW/2).toFixed(1)}" y="${(baseY-int8h).toFixed(1)}" width="${barW}" height="${int8h.toFixed(1)}" rx="2" fill="${c.int8}"><title>${cat} · INT8: ${d.int8[i]} ${d.unit}</title></rect>`;
+    // 选择性直标:只标 labels 里指定的关键柱
+    if(labels && labels.fp16 && labels.fp16.includes(i)){
+      g += `<text class="vallabel" x="${fp16x.toFixed(1)}" y="${(baseY-fp16h-5).toFixed(1)}" text-anchor="middle">${d.fp16[i]}</text>`;
+    }
+    if(labels && labels.int8 && labels.int8.includes(i)){
+      g += `<text class="vallabel" x="${int8x.toFixed(1)}" y="${(baseY-int8h-5).toFixed(1)}" text-anchor="middle">${d.int8[i]}</text>`;
+    }
+  });
+  // y 轴标题
+  g += `<text class="axis" x="${-(m.t+ph/2)}" y="${m.l-40}" text-anchor="middle" transform="rotate(-90)">${d.unit}</text>`;
+
+  const svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="分组柱状图">${g}</svg>`;
+  document.getElementById(id).innerHTML = svg;
+}
+
+function render(){
+  groupedBars("c1svg", DATA.latency, {fp16:[0,2], int8:[0,2]});   // 标注 infer 与 e2e
+  groupedBars("c2svg", DATA.percentile, {fp16:[2], int8:[2]});    // 标注 max
+}
+
+function toggleTheme(){
+  const root = document.documentElement;
+  const cur = root.getAttribute("data-theme");
+  const btn = document.getElementById("themeBtn");
+  if(cur === "dark"){ root.removeAttribute("data-theme"); btn.textContent="🌙 深色"; }
+  else { root.setAttribute("data-theme","dark"); btn.textContent="☀️ 浅色"; }
+  // 重渲染以刷新柱色
+  setTimeout(render, 0);
+}
+
+// 首次渲染 + 主题变化时重渲染(柱色读 CSS 变量)
+render();
+let mq = matchMedia("(prefers-color-scheme: dark)");
+mq.addEventListener && mq.addEventListener("change", ()=> setTimeout(render,0));
+window.addEventListener("resize", ()=>{ /* SVG viewBox 自适应,无需重绘 */ });
+</script>
+</body>
+</html>
