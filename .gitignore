@@ -56,6 +56,9 @@ datasets/**/train.cache
 # ---- 评测中间产物 (eval_failures 是 eval 模式每跑一次重新生成的) ----
 eval_failures/
 
+# ---- 根目录散落的 val/ 是 datasets/crack-seg/images/val 的副本, 去重 ----
+/val/
+
 # ---- 临时/调试输出 ----
 *.png.bak
 cmp_*_out.png
