@@ -680,6 +680,102 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
 }
 
 // =====================================================================
+//  demo 模式 (S4): 视频文件 / 图像目录 → 零拷贝推理 + filter-first 后处理
+//  → 框 + 4×4 掩码涂色 + OSD(run/post/FPS/检测数) → 写 mp4
+//  避开相机 30FPS 节拍, 展示真实处理吞吐 (与 Python video_cut.py 的 ~29FPS 对照).
+//  - 视频源: 逐帧处理, fps 沿用源 (播放呈真实速率, OSD 显示处理 FPS)
+//  - 图像目录: 每张重复 HOLD 帧 @24fps (~0.33s/张, 看清掩码), 适合做 gif
+// =====================================================================
+static int mode_demo(RknnSeg& m, const std::string& src, const std::string& out_path){
+    bool is_dir=false; DIR* d=opendir(src.c_str());
+    if(d){ closedir(d); is_dir=true; }
+
+    std::vector<std::string> img_files;
+    cv::VideoCapture cap;
+    int fw=0,fh=0,total=0; double fps_in=25.0;
+
+    if(is_dir){
+        d=opendir(src.c_str());
+        struct dirent* ent;
+        while((ent=readdir(d))!=nullptr){
+            std::string nm=ent->d_name;
+            if(nm=="."||nm=="..") continue;
+            std::string lo=nm; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+            auto ends=[&](const char* s){size_t L=std::strlen(s);return lo.size()>=L&&lo.compare(lo.size()-L,L,s)==0;};
+            if(ends(".jpg")||ends(".jpeg")||ends(".png")) img_files.push_back(src+"/"+nm);
+        }
+        closedir(d);
+        std::sort(img_files.begin(),img_files.end());
+        if(img_files.empty()){ fprintf(stderr,"no images in dir %s\n",src.c_str()); return 1; }
+        cv::Mat tmp=cv::imread(img_files[0]);
+        if(tmp.empty()){ fprintf(stderr,"read first image fail: %s\n",img_files[0].c_str()); return 1; }
+        fh=tmp.rows; fw=tmp.cols; total=(int)img_files.size();
+        printf("demo (图像目录): %d 图  %dx%d  → %s\n",total,fw,fh,out_path.c_str());
+    } else {
+        cap.open(src);
+        if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
+        fw=int(cap.get(cv::CAP_PROP_FRAME_WIDTH)); fh=int(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        fps_in=cap.get(cv::CAP_PROP_FPS); if(fps_in<=0) fps_in=25.0;
+        total=int(cap.get(cv::CAP_PROP_FRAME_COUNT));
+        cv::Mat wf; for(int i=0;i<3;i++){ if(cap.read(wf)&&!wf.empty()) m.run(letterbox(wf.clone())); }  // 预热
+        cap.set(cv::CAP_PROP_POS_FRAMES,0);
+        printf("demo (视频): %s  %dx%d  fps=%.1f  帧数=%d  → %s\n",src.c_str(),fw,fh,fps_in,total,out_path.c_str());
+    }
+    if(fw<=0||fh<=0){ fprintf(stderr,"bad frame size %dx%d\n",fw,fh); return 1; }
+
+    double out_fps = is_dir ? 24.0 : fps_in;
+    int    hold    = is_dir ? 8   : 1;     // 图像目录每张重复 8 帧 (~0.33s @24fps)
+    cv::VideoWriter vw(out_path, cv::VideoWriter::fourcc('m','p','4','v'), out_fps, cv::Size(fw,fh));
+    if(!vw.isOpened()){ fprintf(stderr,"VideoWriter open fail: %s\n",out_path.c_str()); return 1; }
+
+    std::vector<double> run_ms,post_ms,e2e_ms; int det=0,written=0; double sum_conf=0;
+    auto process_one=[&](const cv::Mat& frame)->cv::Mat{
+        int H=frame.rows,W=frame.cols;
+        cv::Mat img640=letterbox(frame.clone());
+        auto t0=Clock::now(); double r=m.run(img640); Result R=post_process(m,W,H,false); double e=ms_since(t0);
+        run_ms.push_back(r); post_ms.push_back(e-r); e2e_ms.push_back(e);
+        cv::Mat anno=draw(frame,R);
+        if(!R.confs.empty()){ det++; sum_conf+=R.confs[0]; }
+        float fps=e>0?1000.0f/(float)e:0;
+        char osd[160];
+        std::snprintf(osd,160,"[ZC] run %.0fms post %.0fms  %.1fFPS  %s",r,e-r,fps,
+            R.confs.empty()?"no detect":(std::string(std::to_string(R.confs.size())+" obj mask="+std::to_string(R.mask.empty()?0:(int)cv::countNonZero(R.mask))).c_str()));
+        cv::putText(anno,osd,cv::Point(8,std::max(20,fh-12)),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),2);
+        return anno;
+    };
+
+    if(is_dir){
+        for(int i=0;i<(int)img_files.size();i++){
+            cv::Mat frame=cv::imread(img_files[i]);
+            if(frame.empty()) continue;
+            cv::Mat anno=process_one(frame);
+            for(int h=0;h<hold;h++) vw.write(anno);
+            written++;
+            if(i%10==0||i<3) printf("[%4d/%d] %s\n",i+1,total,img_files[i].c_str());
+        }
+    } else {
+        cv::Mat frame;
+        while(true){
+            if(!cap.read(frame)||frame.empty()) break;
+            cv::Mat anno=process_one(frame);
+            vw.write(anno); written++;
+            if(written%30==0||written<=3) printf("[%4d/%d]\n",written,total>0?total:written);
+        }
+        cap.release();
+    }
+    vw.release();
+
+    auto st=[&](std::vector<double>&v){double s=0;for(double x:v)s+=x;return v.empty()?0.0:s/v.size();};
+    printf("\n==== demo 总结 (%d 帧) ====\n",written);
+    printf("NPU run  mean=%.1f ms\n",st(run_ms));
+    printf("后处理    mean=%.1f ms\n",st(post_ms));
+    printf("端到端    mean=%.1f ms → %.1f FPS (处理)\n",st(e2e_ms),1000.0/st(e2e_ms));
+    printf("命中: %d/%d  avg_max_conf=%.3f\n",det,written,written?sum_conf/written:0);
+    printf("结果视频: %s\n",out_path.c_str());
+    return 0;
+}
+
+// =====================================================================
 //  eval 模式 (S1): 板端 mAP 评测
 //  - 解析 YOLO seg polygon GT (归一化坐标) → 原图分辨率二值掩码 + 框
 //  - 对 val/test 集逐图推理+后处理, 逐实例光栅化掩码
@@ -1175,8 +1271,9 @@ int main(int argc, char** argv){
                         "  %s image <model.rknn> <img>\n"
                         "  %s cam   <model.rknn> [src]\n"
                         "  %s bench <model.rknn> [src] [N]\n"
+                        "  %s demo  <model.rknn> <video_or_dir> [out.mp4]\n"
                         "  %s eval  <model.rknn> <dataset_dir> [split]\n",
-                argv[0],argv[0],argv[0],argv[0]);
+                argv[0],argv[0],argv[0],argv[0],argv[0]);
         return 1;
     }
     std::string mode=argv[1], model=argv[2];
@@ -1185,6 +1282,7 @@ int main(int argc, char** argv){
     if(mode=="image") rc=mode_image(m,argv[3]);
     else if(mode=="cam") rc=mode_cam(m,argc>3?argv[3]:"/dev/video44");
     else if(mode=="bench") rc=mode_bench(m,argc>3?argv[3]:"/dev/video44",argc>4?atoi(argv[4]):100);
+    else if(mode=="demo") rc=mode_demo(m,argv[3],argc>4?argv[4]:"demo_out.mp4");
     else if(mode=="eval") rc=mode_eval(m,argv[3],argc>4?argv[4]:"val");
     else { fprintf(stderr,"unknown mode %s\n",mode.c_str()); rc=1; }
     m.release(); return rc;

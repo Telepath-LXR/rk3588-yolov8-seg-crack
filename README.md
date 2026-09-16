@@ -17,6 +17,31 @@
 
 ---
 
+## 效果展示
+
+> `rknn_seg_zc demo` 模式（S4）：视频文件 / 图像目录 → 零拷贝推理 + filter-first 后处理 → 框 + 4×4 掩码涂色 + OSD → 写 mp4/gif。**刻意避开相机 30 FPS 节拍**，展示真实处理吞吐。
+
+**实测演示**（50 张裂缝图像目录 → `demo_imgs.mp4`，再做 `demo_small.gif`）：
+
+![裂缝检测 demo](demo/demo_small.gif)
+
+> 平均置信度 **0.785**，处理吞吐 **60.2 FPS**（OSD 实时显示）。GIF 80 帧 / 10s / 1.9 MB。
+
+**端到端吞吐对比**（Python 基线 → C++ 零拷贝，视频文件源无相机节拍）：
+
+![FPS 对比](demo/fps_comparison.png)
+
+| 阶段 | 推理 | 后处理 | 端到端 | FPS | 备注 |
+|---|---|---|---|---|---|
+| Python 参考基线（`RKNNLite`） | 24.9 ms | 9.1 ms | 34.0 ms | **29.4** | numpy↔NPU 拷贝 + 自动反量化 |
+| C++ 零拷贝（schedutil 调速器） | ~19 ms | 0.6 ms | ~22.8 ms | **43.0** | 零拷贝 + filter-first，调速器未锁频 |
+| **C++ 零拷贝（performance 调速器）** | **15.8 ms** | **0.6 ms** | **16.3 ms** | **61.2** | 8 核锁 performance，NPU 逼近 1 GHz 极限 |
+| 相机实时墙钟 | — | — | 33.3 ms | **30.0** | IMX415 ISP 硬件节拍上限（非推理瓶颈） |
+
+**2.08× 提升**（29.4 → 61.2 FPS）。NPU 推理占端到端 96.7%，软件开销 <0.6 ms，推理已逼近 RK3588 NPU 1 GHz 硬件极限。**相机实时仍 30 FPS**：这是 IMX415 硬件节拍，不是推理瓶颈——视频文件源展示的是真实处理吞吐。数据见研究报告 L303-306，如实未改。
+
+---
+
 ## 一、效果定位
 
 一句话：**把 YOLOv8-seg 在 RK3588 上的推理-后处理路径优化至硬件计算极限（NPU 占端到端 96.7%），精度与 Python 参考对齐，为端侧视觉感知提供高吞吐、低延迟、零拷贝前端。**
@@ -149,6 +174,10 @@ export LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 # 视频吞吐 (无相机节拍, 展示真实 61 FPS)
 ./rknn_seg_zc bench yolo8n_int8_cut.rknn /oem/SampleVideo_1280x720_5mb.mp4 300
 
+# demo 生成可视化 (视频文件或图像目录 → 涂色+OSD mp4, 避开相机节拍展示真实处理 FPS)
+./rknn_seg_zc demo  yolo8n_int8_cut.rknn /oem/SampleVideo_1280x720_5mb.mp4 demo_video.mp4
+./rknn_seg_zc demo  yolo8n_int8_cut.rknn datasets/crack-seg/images/val    demo_imgs.mp4
+
 # 板端 mAP 评测 (eval 模式, 需 datasets/crack-seg)
 ./rknn_seg_zc eval  yolo8n_int8_cut.rknn /path/to/crack-seg val
 #   → 生成 eval_report.md (Box/Mask mAP50/mAP50-95/recall/miss/IoU + 失败样例)
@@ -164,6 +193,7 @@ python3 eval_py.py yolo8n_int8_cut.rknn /path/to/crack-seg val
 | `image` | `image <model> <img>` | 单图推理 + 可视化，精度回归 |
 | `cam` | `cam <model> [src]` | 相机实时显示，默认 `/dev/video44` |
 | `bench` | `bench <model> [src] [N]` | N 帧基准，打印推理/后处理/FPS |
+| `demo` | `demo <model> <video_or_dir> [out.mp4]` | 视频文件/图像目录 → 零拷贝推理 + 涂色 + OSD → mp4，避开相机节拍展示真实吞吐（S4） |
 | `eval` | `eval <model> <dataset_dir> [split]` | val 集 mAP 评测，生成 `eval_report.md` |
 
 环境变量：`CORE_MASK=0|1|3|7|0xffff` 覆盖 NPU 核心掩码（默认 `CORE_0`，小模型单核已饱和）；`EVAL_DEBUG=1` 打印 eval 逐图调试。
@@ -251,6 +281,7 @@ Python 参考路径（`post_cut.py` / `eval_py.py`）对齐：`OBJ_THRESH=0.01`�
 | [`probe_zero_copy.cpp`](probe_zero_copy.cpp) | 探测 NPU 原生张量格式 |
 | [`build_zc.sh`](build_zc.sh) | 交叉编译脚本 |
 | [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 |
+| [`demo/`](demo/) | S4 演示产物：`demo_small.gif`、`demo_imgs.mp4`、`fps_comparison.png`、`make_fps_chart.py` |
 | [`seg/`](seg/) | 训练产物（args.yaml/results.csv/权重/PR 曲线） |
 | [`datasets/crack-seg/`](datasets/crack-seg/) | 数据集（images/labels × val/test） |
 
