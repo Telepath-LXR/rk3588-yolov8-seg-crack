@@ -40,6 +40,17 @@
 
 **2.08× 提升**（29.4 → 61.2 FPS）。NPU 推理占端到端 96.7%，软件开销 <0.6 ms，推理已逼近 RK3588 NPU 1 GHz 硬件极限。**相机实时仍 30 FPS**：这是 IMX415 硬件节拍，不是推理瓶颈——视频文件源展示的是真实处理吞吐。数据见研究报告 L303-306，如实未改。
 
+**延迟分布与 10 分钟热稳定性**（36000 帧持续推理，≈10 min，performance 调速器，堵两个评审缺口）：
+
+| 指标 | mean | p50 | p95 | 说明 |
+|---|---|---|---|---|
+| NPU run（`PERF_RUN`） | 15.9 ms | 15.9 ms | 16.0 ms | 真实 NPU 计算，36000 帧无降频 |
+| 端到端（run+后处理+拷贝+sync） | 16.3 ms | 16.2 ms | 16.6 ms | → **61.3 FPS**，p95 仅 +0.4 ms |
+
+- **尾延迟可忽略**：36000 帧 p95 比 mean 高 0.4 ms（端到端）/ 0.1 ms（NPU），无长尾。300 帧快照 p50≈mean、p95 仅 +0.1 ms，二者吻合。
+- **零降频**：10 min 内热采样 120 次，**NPU 频率全程锁 1 GHz**（无一帧跌频）；NPU 温度 32.4 °C → 峰值 38.8 °C → 末值 37.0 °C，全部热区 ≤39.8 °C，远低于降频阈值（~85-95 °C）。
+- 原始数据：[`eval_results/bench_10min.log`](eval_results/bench_10min.log)（36000 帧逐帧 + 总结）、[`eval_results/thermal_10min.csv`](eval_results/thermal_10min.csv)（120 样本 npufreq/7 热区）。
+
 ---
 
 ## 一、效果定位
@@ -212,7 +223,7 @@ python3 eval_py.py yolo8n_int8_cut.rknn /path/to/crack-seg val
 
 **如实报告，未为好看调数字。**
 
-1. **相机 30 FPS 是真天花板，不是推理瓶颈。** 用 `RKNN_QUERY_PERF_RUN` 分离出 NPU 计算 15.77 ms、软件开销 <0.6 ms（NPU 占端到端 96.7%），推理已逼近 NPU 1 GHz 硬件极限。墙钟 FPS 受 IMX415 ISP 30 FPS 节拍限制（见 [`cam-imx415-30fps-hardlimit` 记忆]）。视频文件源可跑到 61 FPS 展示真实吞吐。
+1. **相机 30 FPS 是真天花板，不是推理瓶颈。** 用 `RKNN_QUERY_PERF_RUN` 分离出 NPU 计算 15.77 ms、软件开销 <0.6 ms（NPU 占端到端 96.7%），推理已逼近 NPU 1 GHz 硬件极限。墙钟 FPS 受 IMX415 ISP 30 FPS 节拍限制（见 [`cam-imx415-30fps-hardlimit` 记忆]）。视频文件源可跑到 61 FPS 展示真实吞吐。**10 分钟 / 36000 帧持续推理验证**：NPU 频率全程锁 1 GHz 无降频，p95 端到端 16.6 ms（仅 +0.4 ms 尾延迟），峰值 38.8 °C 远未触阈（见 [效果展示](#效果展示) 延迟/热稳定表与 [`eval_results/`](eval_results/)）。
 
 2. **单类（crack）。** cls 通道=1 硬编码，`rknn_seg_zc.cpp` 多类路径已预留但未启用。单类 demo 对简历/验证完全够；多类需重训 + 改后处理。
 
@@ -280,7 +291,7 @@ Python 参考路径（`post_cut.py` / `eval_py.py`）对齐：`OBJ_THRESH=0.01`�
 | [`convert_cut.py`](convert_cut.py) | ONNX→RKNN INT8 转换（用 rknn2 环境！） |
 | [`probe_zero_copy.cpp`](probe_zero_copy.cpp) | 探测 NPU 原生张量格式 |
 | [`build_zc.sh`](build_zc.sh) | 交叉编译脚本 |
-| [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 |
+| [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 + 10 min bench/thermal 数据 |
 | [`demo/`](demo/) | S4 演示产物：`demo_small.gif`、`demo_imgs.mp4`、`fps_comparison.png`、`make_fps_chart.py` |
 | [`seg/`](seg/) | 训练产物（args.yaml/results.csv/权重/PR 曲线） |
 | [`datasets/crack-seg/`](datasets/crack-seg/) | 数据集（images/labels × val/test） |

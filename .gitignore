@@ -67,6 +67,8 @@ result.jpg
 test.jpg
 *.log
 *.tmp
+# 例外: 10 分钟 bench/thermal 原始数据 (README 引用, 评审证据, 2MB)
+!eval_results/bench_10min.log
 
 # ---- IDE / 编辑器 ----
 .vscode/
