@@ -94,7 +94,7 @@ ax.tick_params(axis="x", length=3, color=INK_MUTED)
 ax.set_title("YOLOv8-seg 端到端处理吞吐：Python 基线 → C++ 零拷贝优化",
              fontsize=13.5, color=INK_PRI, fontweight="bold",
              loc="left", pad=16)
-ax.text(0, 1.045, "2.08× 提升  ·  NPU 推理占端到端 96.7%  ·  推理已逼近 RK3588 NPU 1 GHz 硬件极限",
+ax.text(0, 1.045, "2.08× 提升  ·  NPU 推理占端到端 96.7%  ·  处理链路主要耗时位于 NPU 执行阶段",
         transform=ax.transAxes, fontsize=9.5, color=INK_SEC)
 
 # ---- 诚实注释（底部小字）----
