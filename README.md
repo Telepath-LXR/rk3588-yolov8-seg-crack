@@ -42,7 +42,7 @@
 
 **YOLO11 检测 vs YOLOv8-seg 分割**（同口径 Python `RKNNLite` bench，300 帧 `/oem/SampleVideo_1280x720_5mb.mp4`，8 核 performance，`NPU_CORE_0_1_2`）：
 
-![YOLO 检测 vs 分割 FPS](demo/yolo_vs_seg_fps.png)
+![YOLO 检测 vs 分割 FPS]
 
 | 模型 | 任务 | NPU 计算 | 后处理 | 端到端 | FPS |
 |---|---|---|---|---|---|
@@ -146,13 +146,13 @@ IMX415 →[V4L2 async]→ 零拷贝输入(int8=pixel-128)
 
 ### 交叉编译工具链
 
-- **buildroot aarch64 g++ 13.4.0**：`/home/alientek/atk_dlrk3588_linux6.1/buildroot/output/alientek_rk3588/host/bin/aarch64-buildroot-linux-gnu-g++`
+- **buildroot aarch64 g++ 13.4.0**：`atk_dlrk3588_linux6.1/buildroot/output/alientek_rk3588/host/bin/aarch64-buildroot-linux-gnu-g++`
 - **sysroot**：含 librknnrt.so + opencv4 头/库
 - 见 [`build_zc.sh`](build_zc.sh)
 
 ### 模型转换工具链（PC 侧）
 
-- **rknn-toolkit2 v2.3.2**（conda env `rknn2`，`/home/alientek/anaconda3/envs/rknn2/bin/python3`）
+- **rknn-toolkit2 v2.3.2**（conda env `rknn2`，`anaconda3/envs/rknn2/bin/python3`）
   - ⚠️ **必须用 `rknn2` 环境**。`pytorch` 环境（toolkit v1.5.2）对 cut-tail ONNX 会触发 `onnxoptimizer` segfault。
 - **onnxruntime 1.19.2**（host FP32 参考验证用）
 - **ultralytics**（训练 + val 参考）
@@ -164,7 +164,7 @@ IMX415 →[V4L2 async]→ 零拷贝输入(int8=pixel-128)
 ### 1. 交叉编译 C++ 推理程序
 
 ```bash
-cd /home/alientek/yolo8-seg
+cd /yolo8-seg
 bash build_zc.sh          # 产出 aarch64 ELF: rknn_seg_zc
 ```
 
@@ -229,7 +229,7 @@ python3 eval_py.py yolo8n_int8_cut.rknn /path/to/crack-seg val
 
 ```bash
 # 用 rknn2 环境 (不是 pytorch!)
-/home/alientek/anaconda3/envs/rknn2/bin/python3 convert_cut.py
+/anaconda3/envs/rknn2/bin/python3 convert_cut.py
 #   读 yolo8n_cut.onnx → INT8 量化 (50 张校准图 quant.txt) → yolo8n_int8_cut.rknn
 ```
 
