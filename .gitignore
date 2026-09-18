@@ -70,6 +70,17 @@ test.jpg
 # 例外: 10 分钟 bench/thermal 原始数据 (README 引用, 评审证据, 2MB)
 !eval_results/bench_10min.log
 
+# ---- 云端复核链路运行时产物 (cloud/spool/) ----
+# outbox/done/failed 是端侧采样与云复核的运行时流转目录, 不入库;
+# PAUSE 是 cloud_bridge 限流/磁盘水位标记文件;
+# daily_report_*.md 是日报脚本按日生成产物 (如需留档可手动 git add -f).
+# 保留 review_ledger.jsonl 跟踪 —— 它是真实 Qwen-VL 复核决策证据.
+cloud/spool/outbox/
+cloud/spool/done/
+cloud/spool/failed/
+cloud/spool/PAUSE
+cloud/daily_report_*.md
+
 # ---- IDE / 编辑器 ----
 .vscode/
 .idea/

@@ -40,6 +40,18 @@
 
 **2.08× 提升**（29.4 → 61.2 FPS）。NPU 推理占端到端 96.7%，软件开销 <0.6 ms，处理链路主要耗时位于 NPU 执行阶段（单核 `CORE_0`，1 GHz）。**相机实时仍 30 FPS**：这是 IMX415 硬件节拍，不是推理瓶颈——视频文件源展示的是真实处理吞吐。数据见研究报告 L303-306，如实未改。
 
+**YOLO11 检测 vs YOLOv8-seg 分割**（同口径 Python `RKNNLite` bench，300 帧 `/oem/SampleVideo_1280x720_5mb.mp4`，8 核 performance，`NPU_CORE_0_1_2`）：
+
+![YOLO 检测 vs 分割 FPS](demo/yolo_vs_seg_fps.png)
+
+| 模型 | 任务 | NPU 计算 | 后处理 | 端到端 | FPS |
+|---|---|---|---|---|---|
+| YOLO11 INT8（4.25 MB） | COCO 80 类检测 | 16.8 ms | 2.9 ms | 24.5 ms | **27.3** |
+| YOLOv8-seg INT8（4.55 MB） | crack 单类分割 | 15.4 ms | 8.2 ms | 31.3 ms | **22.7** |
+| YOLOv8-seg FP16（7.99 MB） | crack 单类分割 | 31.0 ms | 7.8 ms | 60.2 ms | **13.8** |
+
+> 检测比分割快 1.20×（27.3 vs 22.7 FPS）：两者 NPU 计算相近（16.8 vs 15.4 ms），差距主要来自分割多出的掩码系数(32ch)与原型掩码(32×160×160)后处理（8.2 vs 2.9 ms）。FP16 推理为 INT8 的 0.44× 速度。三模型 NPU 均锁 1 GHz、温度峰值 ≤36.1 °C，无热降频。**非精度/性价比排名**——任务复杂度(80 类 vs 单类、有无掩码)、模型结构、量化精度三因素未单独隔离。全指标见 [`eval_results/yolo_vs_seg/对比报告.md`](eval_results/yolo_vs_seg/对比报告.md)。
+
 **延迟分布与 10 分钟热稳定性**（36000 帧持续推理，≈10 min，performance 调速器）：
 
 | 指标 | mean | p50 | p95 | p99 | max |
@@ -239,6 +251,88 @@ python3 eval_py.py yolo8n_int8_cut.rknn /path/to/crack-seg val
 
 ---
 
+## 六、云端 VLM 复核（灰区二次判定，可选增值）
+
+> **定位**：端侧 INT8 分割对低置信**灰区** `[OBJ_THRESH=0.18, CLOUD_HI=0.45)` 的检测框采样上传，云端 Qwen-VL 复核，回写 `upgrade`/`downgrade`/`human_queue`/`keep_edge` 决策，`daily_report` 聚合。**这是端侧主流程之上的可选纵向增值，非本项目核心交付**——端侧分割推理链路（见二/四节）独立成立，不依赖云端。
+
+### 数据流
+
+```mermaid
+flowchart LR
+    A["rknn_seg_zc cam<br/>(C++ 端侧采样)"] --> O["cloud/spool/outbox/<br/>crop.jpg + meta.json"]
+    B["live_spool.py<br/>(Python 实时镜像)"] --> O
+    C["replay_spool.py<br/>(PC 离线回放)"] --> O
+    O --> BR["cloud_bridge.py<br/>监视+串行上传"]
+    BR -->|"HTTP /review"| RV["review.py<br/>(Qwen-VL)"]
+    RV -->|"decision"| D["cloud/spool/done/<br/>result.json"]
+    RV -.->|"append"| L["cloud/spool/<br/>review_ledger.jsonl"]
+    D --> RP["daily_report.py<br/>聚合当日"]
+    L --> RP
+    RP --> RPT["cloud/daily_report_*.md"]
+```
+
+### 文件清单（`cloud/` 子目录）
+
+| 文件 | 作用 |
+|---|---|
+| [`cloud/live_spool.py`](cloud/live_spool.py) | 板端相机实时灰区采样，`rknn_seg_zc.cpp::cloud_sample` 的 Python 镜像（RKNNLite + `post_cut.post_process`） |
+| [`cloud/replay_spool.py`](cloud/replay_spool.py) | PC 离线用 `best.pt` 跑 val 集模拟灰区采样，无板子时打通云端链路 |
+| [`cloud/cloud_bridge.py`](cloud/cloud_bridge.py) | 端侧上传守护进程：监视 `outbox/`，串行 POST 到 `/review`，限流/重试/磁盘水位 |
+| [`cloud/review.py`](cloud/review.py) | 最薄复核代理：鉴权 + 限流 + 预算 + prompt 组装 + Qwen-VL 调用 + JSON 校验 + ledger 记账 |
+| [`cloud/daily_report.py`](cloud/daily_report.py) | 扫 `done/` 聚合当日复核事件 → Markdown 日报（`--all` 看历史全部） |
+| [`cloud/run_pipeline.sh`](cloud/run_pipeline.sh) | 一键驱动脚本，子命令式（见下） |
+| [`cloud/spool/review_ledger.jsonl`](cloud/spool/review_ledger.jsonl) | **评审证据**：真实 Qwen-VL 复核记录（见下） |
+
+> 端侧采样参数（C++ ↔ Python 逐项对齐）：外扩 30% / resize 长边 512 / JPEG q85 / 5s+20px 去重 / `<ts_ms>_<frame_id>` 命名 / 原子写 `.tmp`→rename。C++ 端经 `CLOUD_SPOOL_DIR` env（`rknn_seg_zc.cpp:88`）对接，Python 端经 `SPOOL_DIR` env。
+
+### 现有证据
+
+`cloud/spool/review_ledger.jsonl` 已有 **154 条真实 Qwen-VL（`qwen3-vl-flash`）复核记录**（板端相机实时采样 → PC 端 review 服务复核，实跑链路打通），决策分布：`downgrade` 100（65%）、`upgrade` 31（20%）、`human_queue` 22（14%）、`keep_edge` 1（1%）。**以下调为主**——低置信灰区中近三分之二被 VLM 判为非裂缝误检（阴影/线缆/污渍等），与灰区"拿不准才送云"的定位一致。
+
+### 运行
+
+```bash
+# A. PC 离线打通整条端云链路（不需板子/相机，需 DASHSCOPE_API_KEY）
+DASHSCOPE_API_KEY=xxx ./cloud/run_pipeline.sh local
+#    replay_spool 产灰区 → review 服务 → cloud_bridge 上传 → daily_report
+
+# B. 板端相机实时采样（需另开两终端：serve + bridge）
+./cloud/run_pipeline.sh serve                          # 终端1：启云端复核服务
+./cloud/run_pipeline.sh bridge                         # 终端2：启上传守护
+./cloud/run_pipeline.sh camera yolo8n_int8_cut.rknn /dev/video44  # 终端3：相机实时
+
+# C. 仅生成日报
+./cloud/run_pipeline.sh report          # 当日
+./cloud/run_pipeline.sh report --all     # 历史全部
+
+# C++ 端侧对接（cam 模式 + CLOUD_SPOOL_DIR）
+CLOUD_SPOOL_DIR=cloud/spool ./rknn_seg_zc cam yolo8n_int8_cut.rknn /dev/video44
+```
+
+### 环境变量
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `DASHSCOPE_API_KEY` | 云端 VLM 鉴权（serve/local 必需） | — |
+| `SPOOL_DIR` | spool 根目录（相对 cloud/ 运行即解析为 `cloud/spool`） | `spool` |
+| `CLOUD_SPOOL_DIR` | C++ 端侧 outbox 根（`rknn_seg_zc.cpp` 用） | `spool` |
+| `CLOUD_HI` / `CLOUD_CONF_HI` | 灰区上界（Python / C++ 各自 env 名） | `0.45` |
+| `OBJ_THRESH` | 灰区下界（与端侧分割 `OBJ_THRESH` 对齐） | `0.18` |
+| `DEVICE_TOKEN` / `TOKENS_JSON` | 上传鉴权 token / review 服务允许的 token 集 | `test-token` |
+| `DAILY_BUDGET_YUAN` | 每日预算上限（元，超则 429） | `10.0` |
+| `PRICE_PER_1K_TOKENS` | token 估算单价（预算闸门用） | `0.0003` |
+| `CLOUD_ENDPOINT` | review 服务 URL | `http://localhost:8000/review` |
+| `DEVICE_ID` | 写入 meta 的设备标识 | `pc-replay-01` / `live-spool-01` |
+| `HEADLESS` | `live_spool.py` 不开显示窗口（`1`） | `0` |
+
+### 诚实声明
+
+1. **`cost_yuan` 为估算，非真实账单。** review.py 按 `usage.total_tokens × PRICE_PER_1K_TOKENS / 1000` 估算成本写入 ledger，预算闸门（`_budget_check`）基于该估算随用量增长触发。真实账单以云控制台为准；`PRICE_PER_1K` 默认取 DashScope `qwen3-vl-flash` 公开价 0.0003 元/千 token，留 env 覆盖。
+2. **灰区上下界 `[0.18, 0.45)` 与 C++ 对齐。** 下界 = `rknn_seg_zc.cpp` 的 `OBJ_THRESH`（filter-first 第一道筛），上界 = `CLOUD_HI`/`CLOUD_CONF_HI`。`< 0.18` 的低分不送云（端侧直接丢弃），`≥ 0.45` 的高分不送云（端侧直接采信），仅灰区送云二次判定。
+3. **云复核非核心交付。** 本项目核心是端侧 INT8 分割零拷贝部署（见二/四节），云复核链路是端侧主流程之上的可选纵向增值——端侧分割推理、后处理、mAP 评测均独立成立，不依赖云端。154 条 ledger 记录用于演示链路打通（板端相机实时采样 → PC 端云复核），非规模化生产数据。
+
+---
+
 ## 附录 A：模型文件注册表
 
 仓库内 `.rknn` 文件命名规整如下（**最终交付仅 `yolo8n_int8_cut.rknn`**，其余为演进过程/对照）：
@@ -296,9 +390,10 @@ Python 参考路径（`post_cut.py` / `eval_py.py`）对齐：`OBJ_THRESH=0.01`�
 | [`probe_zero_copy.cpp`](probe_zero_copy.cpp) | 探测 NPU 原生张量格式 |
 | [`build_zc.sh`](build_zc.sh) | 交叉编译脚本 |
 | [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 + 10 min bench/thermal 数据 |
-| [`demo/`](demo/) | S4 演示产物：`demo_small.gif`、`demo_imgs.mp4`、`fps_comparison.png`、`make_fps_chart.py` |
+| [`demo/`](demo/) | S4 演示产物：`demo_small.gif`、`demo_imgs.mp4`、`fps_comparison.png`、`yolo_vs_seg_fps.png`、`make_fps_chart.py`、`make_compare_chart.py` |
 | [`seg/`](seg/) | 训练产物（args.yaml/results.csv/权重/PR 曲线） |
 | [`datasets/crack-seg/`](datasets/crack-seg/) | 数据集（images/labels × val/test） |
+| [`cloud/`](cloud/) | 云端 VLM 复核链路（可选增值）：`live_spool.py`/`replay_spool.py`/`cloud_bridge.py`/`review.py`/`daily_report.py`/`run_pipeline.sh` + `spool/review_ledger.jsonl`（详见[第六节](#六云端-vlm-复核灰区二次判定可选增值)） |
 
 ---
 
