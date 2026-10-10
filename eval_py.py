@@ -174,6 +174,7 @@ def compute_ap(all_p, all_g, iou_mat, iou_thr):
             fp[k] = 1
     cum_tp = 0; cum_fp = 0
     prec = [0.0] * len(all_pr); rec = [0.0] * len(all_pr)
+    confs_sorted = [c for (_, _, c) in all_pr]
     for k in range(len(all_pr)):
         cum_tp += tp[k]; cum_fp += fp[k]
         prec[k] = cum_tp / (cum_tp + cum_fp) if (cum_tp + cum_fp) else 0
@@ -185,8 +186,27 @@ def compute_ap(all_p, all_g, iou_mat, iou_thr):
             if rec[k] >= r:
                 pmax = max(pmax, prec[k])
         ap += pmax / 101.0
+
+    # 实时部署工作点 (conf 0.18) 的 P/R/F1 —— 与 rknn_seg_zc.cpp OBJ_THRESH 对齐.
+    # 这是"部署形态下用户实际看到的精度", 也是灰区协同 [0.18, 0.45) 设计的直接依据.
+    def op_point(thr):
+        tp_ = fp_ = 0
+        for k in range(len(all_pr)):
+            if confs_sorted[k] < thr:
+                break
+            tp_ += tp[k]; fp_ += fp[k]
+        rec_ = tp_ / n_gt if n_gt else 0
+        prec_ = tp_ / (tp_ + fp_) if (tp_ + fp_) else 0
+        f1_ = 2 * prec_ * rec_ / (prec_ + rec_) if (prec_ + rec_) else 0
+        return dict(thr=thr, tp=tp_, fp=fp_, n_pred=tp_ + fp_,
+                    precision=prec_, recall=rec_, f1=f1_)
+
     return dict(ap=ap, n_gt=n_gt, tp=n_tp, fp=len(all_pr) - n_tp,
-               recall=n_tp / n_gt, mean_iou=sum_iou / n_tp if n_tp else 0)
+               recall=n_tp / n_gt, mean_iou=sum_iou / n_tp if n_tp else 0,
+               # 多工作点 (双阈值联动标定): 0.10/0.12/0.15/0.18 各给 P/R/F1,
+               # 供"漏检代价>>误检代价"场景权衡下阈值 (降阈值把更多候选送进灰区让云端兜底).
+               ops={t: op_point(t) for t in (0.10, 0.12, 0.15, 0.18)},
+               op018=op_point(0.18), op001=op_point(0.01))
 
 
 def main():
@@ -260,17 +280,36 @@ def main():
     mask_map_lr = np.mean([r['ap'] for r in mask_r_lr])
 
     print("\n==== eval_py 总结 (双线性参考, %d 图) ====" % n_img)
-    print("Box   mAP50=%.6f  mAP50-95=%.6f  recall@0.5=%.6f  miss=%.6f"
+    print("Box   mAP50=%.3f  mAP50-95=%.3f  recall@0.5=%.3f  miss=%.3f"
           % (box_map50, box_map, box_r[0]['recall'], 1 - box_r[0]['recall']))
-    print("Mask  mAP50=%.6f  mAP50-95=%.6f  recall@0.5=%.6f  miss=%.6f  iou_tp=%.6f"
+    print("Mask  mAP50=%.3f  mAP50-95=%.3f  recall@0.5=%.3f  miss=%.3f  iou_tp=%.3f"
           % (mask_map50, mask_map, mask_r[0]['recall'], 1 - mask_r[0]['recall'], mask_r[0]['mean_iou']))
-    print("MaskLR(160) mAP50=%.6f  mAP50-95=%.6f  recall@0.5=%.6f  iou_tp=%.6f"
+    print("MaskLR(160) mAP50=%.3f  mAP50-95=%.3f  recall@0.5=%.3f  iou_tp=%.3f"
           % (mask_map50_lr, mask_map_lr, mask_r_lr[0]['recall'], mask_r_lr[0]['mean_iou']))
     print("正样本 %d / 负样本 %d / 负样本误检 %d" % (n_pos, n_neg, n_fp_neg))
-    print("训练机参考: Box mAP50=0.83 / Mask mAP50=0.67 (epoch 84-90 峰值)")
-    print("C++ (4×4 最近邻, 416 res) 参考: Box mAP50=0.8088 / Mask mAP50=0.6260")
-    print("\n[判定] MaskLR(160) ≈ 训练机 0.67 → INT8 量化未损害 mask 精度, 仅 C++ 实时路径的")
-    print("       4×4 最近邻光栅化 (vs 双线性) + 416 分辨率 IoU 带来 ~4% 下降 (速度换精度, 实时可接受)")
+    print("训练机参考: Box mAP50=0.833 / Mask mAP50=0.666 (epoch 84-90 峰值)")
+    print("C++ (4×4 最近邻, 416 res) 参考: Box mAP50=0.809 / Mask mAP50=0.626 / Mask mAP50-95=0.164")
+
+    # ---- 实时工作点 (conf 0.18) P/R/F1 —— 部署形态下用户实际看到的精度 ----
+    def _fmt_op(name, r):
+        o = r['op018']
+        return ("%s  thr=%.2f  TP=%d FP=%d  P=%.3f R=%.3f F1=%.3f"
+                % (name, o['thr'], o['tp'], o['fp'], o['precision'], o['recall'], o['f1']))
+    print("\n[实时工作点 conf 0.18 精度] (部署口径, 灰区协同 [0.18,0.45) 直接依据)")
+    print("  " + _fmt_op("Box  @IoU0.5", box_r[0]))
+    print("  " + _fmt_op("Mask @IoU0.5", mask_r[0]))
+    print("  " + _fmt_op("MaskLR160@IoU0.5", mask_r_lr[0]))
+
+    # ---- 双阈值联动标定: 多工作点 P/R/F1 (漏检 vs 误检权衡) ----
+    print("\n[双阈值联动标定] Box@IoU0.5 各工作点 P/R/F1 (漏检代价>>误检代价场景供参考)")
+    print("  thr    P      R      F1     TP    FP")
+    for t in (0.10, 0.12, 0.15, 0.18):
+        o = box_r[0]['ops'][t]
+        print("  %.2f  %.3f  %.3f  %.3f  %4d  %4d"
+              % (t, o['precision'], o['recall'], o['f1'], o['tp'], o['fp']))
+
+    print("\n[判定] MaskLR(160) ≈ 训练机 0.666 → INT8 量化未损害 mask 精度, 仅 C++ 实时路径的")
+    print("       4×4 最近邻光栅化 (vs 双线性) + 416 分辨率 IoU 带来 ~4%% 下降 (速度换精度, 实时可接受)")
 
 
 if __name__ == "__main__":

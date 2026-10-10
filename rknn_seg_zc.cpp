@@ -304,6 +304,9 @@ struct Result {
     // —— eval 专用: 保留幸存实例的 640 框 + 32 掩码系数, 供 eval 重光栅化逐实例掩码 ——
     std::vector<std::array<float,4>> boxes640;     // 与 boxes 同序 (640 坐标系)
     std::vector<std::array<float,32>> coeffs;      // 与 boxes 同序
+    // —— 后处理分解计时/计数 (退化曲线分析用) ——
+    int n_cand=0, n_keep=0, n_mask=0;              // 候选数 / NMS 后 / 实际光栅化掩码数
+    double t_cand=0, t_nms=0, t_gemm_raster=0, t_final=0;  // 分段 ms
 };
 struct LB { float r; int left, top, nu_w, nu_h; };
 static LB lb_params(int oh, int ow, int ns=IMG_SIZE){
@@ -380,16 +383,20 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
         }
     }
     double t_cand=ms_since(T1);
-    if(confs.empty()){ if(dbg)fprintf(stderr,"[dbg] proto=%.1f cand=%.1f (ncand=%d) -> empty\n",t_proto,t_cand,n_cand); return R; }
+    if(confs.empty()){ if(dbg)fprintf(stderr,"[dbg] proto=%.1f cand=%.1f (ncand=%d) -> empty\n",t_proto,t_cand,n_cand);
+        R.n_cand=n_cand; R.t_cand=t_cand; return R; }
 
     auto T2=Clock::now();
     std::vector<int> keep = nms(boxes640, confs, conf_thr, NMS_THRESH);
-    if(keep.empty()){ if(dbg)fprintf(stderr,"[dbg] proto=%.1f cand=%.1f (ncand=%d) -> nms empty\n",t_proto,t_cand,n_cand); return R; }
+    if(keep.empty()){ if(dbg)fprintf(stderr,"[dbg] proto=%.1f cand=%.1f (ncand=%d) -> nms empty\n",t_proto,t_cand,n_cand);
+        R.n_cand=n_cand; R.t_cand=t_cand; return R; }
     std::sort(keep.begin(),keep.end(),[&](int a,int b){return confs[a]>confs[b];});
     double t_nms=ms_since(T2);
 
     cv::Mat mask640(IMG_SIZE, IMG_SIZE, CV_8U, cv::Scalar(0));
     int n = (int)std::min((size_t)max_masks, keep.size());
+    R.n_cand=n_cand; R.n_keep=(int)keep.size(); R.n_mask=n;
+    R.t_cand=t_cand; R.t_nms=t_nms;
     if(n > 0){
         auto T3=Clock::now();
         // NEON 融合路径: 跳过 proto 全量反量化, 直接用原生 int8 + coeff 做
@@ -441,6 +448,7 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
             }
         }
         double t_gemm=ms_since(T3), t_raster=ms_since(T4);
+        R.t_gemm_raster = t_gemm;   // gemm+raster 合并段 (框内 NEON dot + memset)
         if(dbg) fprintf(stderr,"[dbg] ncand=%d nkeep=%zu mask=%d | proto=%.1f cand=%.1f nms=%.1f gemm=%.1f raster=%.1f\n",
             n_cand, keep.size(), n, t_proto, t_cand, t_nms, t_gemm, t_raster);
     } else if(dbg){
@@ -456,6 +464,7 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
     else cv::resize(sub, mask_orig, cv::Size(img_w,img_h),0,0,cv::INTER_NEAREST);
     R.mask = mask_orig;
     double t_final=ms_since(Tf);
+    R.t_final = t_final;
     for(int idx: keep){
         auto& bb=boxes640[idx];
         R.boxes.push_back({(bb[0]-b.left)/b.r,(bb[1]-b.top)/b.r,(bb[2]-b.left)/b.r,(bb[3]-b.top)/b.r});
@@ -602,11 +611,26 @@ static int mode_cam(RknnSeg& m, const std::string& src){
 }
 
 static int mode_bench(RknnSeg& m, const std::string& src, int N){
-    bool use_cam = src.find("/dev/video")==0 || src.find('.')==std::string::npos;
-    cv::VideoCapture cap; if(use_cam) cap.open(src,cv::CAP_V4L2); else cap.open(src);
-    if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
+    bool use_cam = src.find("/dev/video")==0;
+    // 图像目录源: 逐张读, 用于密集场景后处理 P95 (避开相机节拍/视频解码)
+    bool is_dir=false; { DIR* d=opendir(src.c_str()); if(d){closedir(d); is_dir=true;} }
+    std::vector<std::string> dir_imgs;
+    cv::VideoCapture cap;
+    if(is_dir){
+        DIR* d=opendir(src.c_str()); struct dirent* ent;
+        while((ent=readdir(d))!=nullptr){ std::string nm=ent->d_name;
+            if(nm.size()>4 && (nm.rfind(".jpg")==nm.size()-4||nm.rfind(".png")==nm.size()-4||nm.rfind(".jpeg")==nm.size()-5))
+                dir_imgs.push_back(src+"/"+nm); }
+        closedir(d); std::sort(dir_imgs.begin(),dir_imgs.end());
+        if(dir_imgs.empty()){ fprintf(stderr,"bench: 目录无图像 %s\n",src.c_str()); return 1; }
+        if(N<=0 || N>(int)dir_imgs.size()) N=(int)dir_imgs.size();
+    } else {
+        if(src.find('.')==std::string::npos) use_cam=true;   // 无扩展名视作相机节点
+        if(use_cam) cap.open(src,cv::CAP_V4L2); else cap.open(src);
+        if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
+    }
     cv::Mat wf;
-    for(int i=0;i<5;i++){ cap.read(wf); if(!wf.empty()) m.run(letterbox(wf.clone())); }
+    if(!is_dir) for(int i=0;i<5;i++){ cap.read(wf); if(!wf.empty()) m.run(letterbox(wf.clone())); }
 
     // ---- 异步采集流水线 (仅对相机生效): 采集线程预读下一帧, 与当前帧推理并行 ----
     // 相机固定 30FPS (cap.read 阻塞 ~33.3ms), 处理仅 ~16.3ms → 每帧有 ~17ms 空闲可隐藏
@@ -639,6 +663,12 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
     std::vector<double> run_ms,post_ms,e2e_ms,wall_ms; int det_frames=0; double sum_conf=0,sum_mask=0;
     double sum_copy=0,sum_sync=0,sum_npu=0,sum_lb=0;
     cv::Mat frame;
+    // 可选: POST_SCALE_CSV=path 落每帧后处理分解 (退化曲线分析)
+    std::ofstream scale_csv;
+    if(const char* cp=getenv("POST_SCALE_CSV")){
+        scale_csv.open(cp);
+        scale_csv << "frame,n_cand,n_keep,n_mask,t_cand,t_nms,t_gemm_raster,t_final,post_total\n";
+    }
     printf("零拷贝 bench: %d 帧 (无显示), 源=%s%s\n",N,src.c_str(), async_cap?" [异步采集流水线]":"");
     for(int i=0;i<N;i++){
         auto tw0=Clock::now();
@@ -648,20 +678,29 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
             { std::unique_lock<std::mutex> lk(cap_mtx); cap_cv.wait(lk, [&]{ return cap_has||cap_fail||cap_stop; });
               if(cap_fail){ printf("frame %d read fail\n",i); break; }
               f = cap_frame; cap_has=false; cap_cv.notify_one(); }
+        } else if(is_dir){
+            f = cv::imread(dir_imgs[i]); if(f.empty()){ printf("frame %d read fail\n",i); continue; }
         } else {
             if(!cap.read(f)||f.empty()){ if(!use_cam){cap.set(cv::CAP_PROP_POS_FRAMES,0);i--;continue;} printf("frame %d read fail\n",i);break; }
         }
         int H=f.rows,W=f.cols;
         auto tlb0=Clock::now(); cv::Mat img640=letterbox(f.clone()); double tlb=ms_since(tlb0);
         double tc,ts;
-        auto t0=Clock::now(); double r=m.run(img640,&tc,&ts); Result R=post_process(m,W,H,true); double e=ms_since(t0);
+        auto t0=Clock::now(); double r=m.run(img640,&tc,&ts); Result R=post_process(m,W,H,false); double e=ms_since(t0);
         double npu = m.last_npu_us/1000.0;
         double wall=ms_since(tw0);
         run_ms.push_back(r); post_ms.push_back(e-r); e2e_ms.push_back(e); wall_ms.push_back(wall); sum_copy+=tc; sum_sync+=ts; sum_npu+=npu; sum_lb+=tlb;
         if(!R.confs.empty()){det_frames++; sum_conf+=R.confs[0]; sum_mask+=(R.mask.empty()?0:cv::countNonZero(R.mask));}
+        // 退化曲线 CSV: 帧,候选,NMS后,光栅化掩码数,候选收集ms,NMSms,光栅化ms,合并掩码ms,总后处理ms
+        if(scale_csv){
+            scale_csv << i << "," << R.n_cand << "," << R.n_keep << "," << R.n_mask << ","
+                      << R.t_cand << "," << R.t_nms << "," << R.t_gemm_raster << "," << R.t_final << ","
+                      << (e-r) << "\n";
+        }
         if(i%10==0||i==N-1) printf("[%3d] run=%5.1f(np%.1f) post=%5.1f e2e=%5.1fms wall=%5.1f lb=%4.2f copy=%4.2f sync=%4.2f %s\n",i+1,r,npu,e-r,e,wall,tlb,tc,ts,
             R.confs.empty()?"no detect":("det="+std::to_string(R.confs.size())).c_str());
     }
+    if(scale_csv){ scale_csv.close(); printf("后处理分解 CSV 已写: %s\n", getenv("POST_SCALE_CSV")); }
     if(async_cap){ { std::lock_guard<std::mutex> lk(cap_mtx); cap_stop=true; cap_cv.notify_all(); } if(cap_thread.joinable()) cap_thread.join(); }
     cap.release();
     auto st=[&](std::vector<double>&v){double s=0;for(double x:v)s+=x;return v.empty()?0.0:s/v.size();};
@@ -788,6 +827,8 @@ static int mode_demo(RknnSeg& m, const std::string& src, const std::string& out_
 // 取 0.01 作为实务下限: 捕获有意义 PR 尾部, 同时避免背景锚点爆炸. 差异可忽略, 已在报告中注明.
 static const float EVAL_CONF     = 0.01f;
 static const int   EVAL_MAX_MASKS = 64;
+// 允许 env 覆盖 eval 置信度阈值 (bench 实时口径用): 设 EVAL_CONF=0.18 即按部署阈值跑 eval.
+static float eval_conf(){ const char* e=getenv("EVAL_CONF"); return e? atof(e) : EVAL_CONF; }
 
 // 归一化 polygon 点集 (单个实例)
 struct GTInst { std::vector<cv::Point2f> poly; };
@@ -938,6 +979,8 @@ struct APResult {
     double ap;          // 101-point AP, -1 若无 GT
     int n_gt, tp, fp;
     double recall, mean_iou;
+    // 实时工作点 (conf 0.18) P/R/F1
+    int op_tp=0, op_fp=0; double op_precision=0, op_recall=0, op_f1=0;
 };
 
 // COCO 风格 AP (单 IoU 阈值). 用预算好的 IoU 矩阵 [img][pred][gt] 避免重复计算.
@@ -990,6 +1033,15 @@ static APResult compute_ap(const std::vector<ImgPreds>& P, const std::vector<Img
         ap += pmax/101.0;
     }
     R.ap=ap;
+    // 实时部署工作点 (conf 0.18) 的 P/R/F1 —— 与 OBJ_THRESH 对齐. all 已按 conf 降序.
+    {
+        int t_=0,f_=0;
+        for(size_t k=0;k<all.size();k++){ if(all[k].conf<0.18f) break; t_+=(int)tp[k]; f_+=(int)fp[k]; }
+        R.op_tp=t_; R.op_fp=f_;
+        R.op_recall = n_gt? (double)t_/n_gt : 0;
+        R.op_precision = (t_+f_)? (double)t_/(t_+f_) : 0;
+        R.op_f1 = (R.op_precision+R.op_recall)>0 ? 2*R.op_precision*R.op_recall/(R.op_precision+R.op_recall) : 0;
+    }
     return R;
 }
 
@@ -1060,13 +1112,21 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
     std::string fail_dir = dataset_dir + "/eval_failures";
     mkdir(fail_dir.c_str(), 0755);
 
-    printf("==== eval: %zu 图, split=%s, conf_thr=%.3f ====\n", imgs.size(), split.c_str(), EVAL_CONF);
+    printf("==== eval: %zu 图, split=%s, conf_thr=%.3f ====\n", imgs.size(), split.c_str(), eval_conf());
     std::vector<ImgPreds> allP; allP.reserve(imgs.size());
     std::vector<ImgGT> allG; allG.reserve(imgs.size());
     std::vector<std::string> img_paths; img_paths.reserve(imgs.size());
     int n_pos_img=0, n_neg_img=0, n_fp_neg=0;
     double sum_run=0, sum_post=0;
     int n_imgs=0;
+    // 可选: POST_SCALE_CSV=path 落 eval 逐图后处理分解 (退化曲线/16.6ms 归因)
+    std::ofstream scale_csv_buf;
+    std::ofstream* eval_csv=nullptr;
+    if(const char* cp=getenv("POST_SCALE_CSV")){
+        scale_csv_buf.open(cp);
+        scale_csv_buf << "frame,n_cand,n_keep,n_mask,t_cand,t_nms,t_gemm_raster,t_final,post_total\n";
+        eval_csv=&scale_csv_buf;
+    }
 
     for(size_t i=0;i<imgs.size();i++){
         cv::Mat frame = cv::imread(imgs[i], cv::IMREAD_COLOR);
@@ -1075,9 +1135,16 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
         cv::Mat img640 = letterbox(frame.clone());
         auto t0=Clock::now();
         double r=m.run(img640);
-        Result R=post_process(m,W,H,false,EVAL_CONF,EVAL_MAX_MASKS);
-        double post=ms_since(t0);
+        auto tp=Clock::now();                    // run 与 post 分开计时 (修复历史"后处理16.56ms"含 NPU run 的标签错误)
+        Result R=post_process(m,W,H,false,eval_conf(),EVAL_MAX_MASKS);
+        double post=ms_since(tp);                // 纯后处理
         sum_run+=r; sum_post+=post; n_imgs++;
+        // eval 逐图后处理分解 (POST_SCALE_CSV): frame,n_cand,n_keep,n_mask,cand,nms,gemm_raster,final,post_total
+        if(eval_csv){
+            *eval_csv << i << "," << R.n_cand << "," << R.n_keep << "," << R.n_mask << ","
+                      << R.t_cand << "," << R.t_nms << "," << R.t_gemm_raster << "," << R.t_final << ","
+                      << post << "\n";
+        }
 
         std::string base=imgs[i].substr(imgs[i].find_last_of('/')+1);
         std::string stem=base.substr(0,base.find_last_of('.'));
@@ -1220,7 +1287,7 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
     rf << "- **模型**: yolo8n_int8_cut.rknn (INT8, cut-tail 图手术)\n";
     rf << "- **数据集**: crack-seg, split=" << split << " (" << n_img << " 图)\n";
     rf << "- **板端**: RK3588 NPU, 零拷贝推理 + filter-first 后处理\n";
-    rf << "- **eval conf_thr**: " << EVAL_CONF << " (逼近完整 PR 曲线; 实时模式用 0.18)\n";
+    rf << "- **eval conf_thr**: " << eval_conf() << " (逼近完整 PR 曲线; 实时模式用 0.18)\n";
     rf << "- **日期**: 2026-09-15\n\n";
     rf << "## 指标\n\n";
     rf << "| 指标 | 值 | 说明 |\n|---|---|---|\n";
@@ -1234,7 +1301,16 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
     rf << "| Mask-IoU (TP mean@0.5) | " << mask_iou_tp << " | 匹配对平均 |\n\n";
     rf << "## 性能 (eval 逐图)\n\n";
     rf << "- 平均 NPU run: " << (n_imgs?sum_run/n_imgs:0) << " ms\n";
-    rf << "- 平均后处理: " << (n_imgs?sum_post/n_imgs:0) << " ms\n\n";
+    rf << "- 平均后处理: " << (n_imgs?sum_post/n_imgs:0) << " ms (纯 post_process, 已剔除 NPU run; eval 低阈值候选多, 不代表实时口径 ~1.4ms)\n\n";
+    // 实时工作点 (conf 0.18) P/R/F1
+    rf << "## 实时工作点精度 (conf 0.18, 部署口径)\n\n";
+    rf << "| 指标 @IoU0.5 | Precision | Recall | F1 | TP | FP |\n|---|---|---|---|---|---|\n";
+    char buf[160];
+    snprintf(buf,sizeof buf,"| Box | %.3f | %.3f | %.3f | %d | %d |\n", box_r[0].op_precision, box_r[0].op_recall, box_r[0].op_f1, box_r[0].op_tp, box_r[0].op_fp);
+    rf << buf;
+    snprintf(buf,sizeof buf,"| Mask | %.3f | %.3f | %.3f | %d | %d |\n", mask_r[0].op_precision, mask_r[0].op_recall, mask_r[0].op_f1, mask_r[0].op_tp, mask_r[0].op_fp);
+    rf << buf;
+    rf << "\n";
     rf << "## 数据集分布\n\n";
     rf << "- 正样本图 (有裂缝): " << n_pos_img << "\n";
     rf << "- 负样本图 (无裂缝): " << n_neg_img << "\n";
@@ -1246,7 +1322,7 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
     rf << "- 即: INT8 量化本身未损害 mask 精度 (160 分辨率口径 0.6689 vs 0.6664, 持平); C++ 实时路径用 4×4 块 memset + 416 分辨率 IoU 换取 ~33FPS 实时性, 这是已知速度-精度折中\n";
     rf << "1. cut-tail 图手术: DFL/Softmax/Sigmoid/box 解码/proto SiLU 全部移出量化图, 仅纯 Conv 量化\n";
     rf << "2. 4×4 最近邻光栅化 (vs Python 双线性), 与 Python 参考有约 4% mask mAP 差 (速度代价)\n";
-    rf << "3. eval conf_thr=" << EVAL_CONF << " 取实务下限, 逼近 ultralytics val 的 PR 曲线, 与训练机评测口径基本对齐\n\n";
+    rf << "3. eval conf_thr=" << eval_conf() << " 取实务下限, 逼近 ultralytics val 的 PR 曲线, 与训练机评测口径基本对齐\n\n";
     rf << "**如实报告, 未为好看调数字。**\n\n";
     rf << "## 失败样例\n\n";
     rf << "见 `eval_failures/`:\n";
@@ -1254,6 +1330,7 @@ static int mode_eval(RknnSeg& m, const std::string& dataset_dir, const std::stri
     rf << "- `fp_*.png`: 误检 (黄粗框=未匹配预测)\n";
     rf << "- (红轮廓=GT 多边形, 蓝半透=预测掩码)\n";
     rf.close();
+    if(eval_csv){ eval_csv->close(); printf("eval 后处理分解 CSV 已写: %s\n", getenv("POST_SCALE_CSV")); }
     printf("报告已写: %s\n", rep.c_str());
 
     printf("\n==== eval 总结 (%s, %d 图) ====\n", split.c_str(), n_img);
