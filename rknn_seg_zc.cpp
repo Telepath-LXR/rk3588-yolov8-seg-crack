@@ -70,6 +70,11 @@ static const int   MAX_MASKS   = 10;
 // sigmoid(x) > MASK_THRESH ⟺ x > logit(MASK_THRESH)
 static const float MASK_LOGIT  = (MASK_THRESH==0.5f)?0.0f:std::log(MASK_THRESH/(1.0f-MASK_THRESH));
 
+// 单类红利量化开关: SIM_CLS=N (env) 时把 cls 当成 N 类模拟多类后处理开销.
+// 模型仍是单类(物理输出 Clogical=1), 只是把同一通道的 conf 重复算 N 次 + per-class NMS 跑 N 趟,
+// 用于分离"单类省的 cls/NMS 开销" vs "零拷贝/NEON/filter-first 的真优化贡献". 仅 bench 用.
+static int sim_cls(){ const char* e=getenv("SIM_CLS"); return e? atoi(e) : 1; }
+
 using Clock = std::chrono::steady_clock;
 static inline double ms_since(Clock::time_point t0){
     return std::chrono::duration<double,std::milli>(Clock::now()-t0).count();
@@ -362,12 +367,20 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
     std::vector<float> confs;
     std::vector<std::array<float,32>> segs;
     int n_cand=0;
+    const int SIM = sim_cls();   // 单类红利模拟: N>1 时把 cls 当 N 类算
 
     for(int s=0;s<3;s++){
         std::vector<float> conf; m.read_cls(s, conf);
         const NativeAttr& ba = m.out_a[3*s];
         int H=ba.H, W=ba.W;
         float stride = (float)IMG_SIZE / H;  // H==W
+        // 单类红利模拟: 把 cls sigmoid 按 SIM 类重复算 (隔离 cls 开销随类数的增长)
+        if(SIM>1){
+            for(int rep=0;rep<SIM-1;rep++){
+                std::vector<float> tmp; m.read_cls(s, tmp);  // 真重算 read_cls (反量化+sigmoid)
+                volatile float sink=tmp.empty()?0:tmp[0]; (void)sink;
+            }
+        }
         for(int y=0;y<H;y++) for(int x=0;x<W;x++){
             float c = conf[y*W+x];
             if(c < conf_thr) continue;
@@ -388,6 +401,13 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
 
     auto T2=Clock::now();
     std::vector<int> keep = nms(boxes640, confs, conf_thr, NMS_THRESH);
+    // 单类红利模拟: per-class NMS 跑 SIM 趟 (C++ demo 多类是对每类各跑一次 NMS)
+    if(SIM>1){
+        for(int rep=0;rep<SIM-1;rep++){
+            std::vector<int> k2 = nms(boxes640, confs, conf_thr, NMS_THRESH);
+            (void)k2;
+        }
+    }
     if(keep.empty()){ if(dbg)fprintf(stderr,"[dbg] proto=%.1f cand=%.1f (ncand=%d) -> nms empty\n",t_proto,t_cand,n_cand);
         R.n_cand=n_cand; R.t_cand=t_cand; return R; }
     std::sort(keep.begin(),keep.end(),[&](int a,int b){return confs[a]>confs[b];});
