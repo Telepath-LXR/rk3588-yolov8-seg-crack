@@ -97,3 +97,9 @@ Thumbs.db
 
 # ---- 最终交付模型: 例外保留 (4.5MB, 让招聘方能直接跑) ----
 !yolo8n_int8_cut.rknn
+
+# COCO 80类对照模型 (单类红利实验用, 大文件不入库)
+yolov8n-seg.pt
+yolov8n-seg.onnx
+yolov8n-seg-coco_cut.onnx
+yolov8n_seg_coco_int8_cut.rknn

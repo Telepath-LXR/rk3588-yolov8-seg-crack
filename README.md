@@ -245,7 +245,7 @@ python3 eval_py.py yolo8n_int8_cut.rknn /path/to/crack-seg val
 
 1. **相机 30 FPS 是真天花板，不是推理瓶颈。** 用 `RKNN_QUERY_PERF_RUN` 分离出 NPU 计算 15.77 ms（单帧实测，相机/视频稀疏源；eval 200 图密集口径 mean 16.08ms）、软件开销 <0.6 ms（NPU 占端到端 96.7%），处理链路主要耗时位于 NPU 执行阶段。墙钟 FPS 受 IMX415 ISP 30 FPS 节拍限制（见 [`cam-imx415-30fps-hardlimit` 记忆]）。视频文件源可跑到 61 FPS 展示真实吞吐。**10 分钟 / 36000 帧持续推理验证**：120 个频率采样点（每 5 s）均记录 1 GHz，逐帧延迟 p99=17.8 ms / max=18.3 ms 无持续抬升；NPU 热区峰值 37.9 °C 远低于固件临界点 115 °C（详见 [效果展示](#效果展示) 延迟/热稳定表与 [`eval_results/`](eval_results/)）。注意：5 s 采样覆盖采样点而非逐帧，结论由采样 + 逐帧延迟分布交叉支持。
 
-2. **单类（crack）。** cls 通道=1 硬编码，`rknn_seg_zc.cpp` 多类路径已预留但未启用。**后处理 0.6ms 是单类口径**：`SIM_CLS` 模拟实测，同管线跑 80 类后处理 ~7.5ms（瓶颈在 cls 收集段，随类数近线性 ×53），单类省 ~6.8ms——我的 0.73ms 里 ~0.6-0.7ms 是单类天然轻，其余是 filter-first+NEON+零拷贝的真优化（光栅化 0.13ms 与类数无关，对多类同样有效）。多类需重训 + 改后处理。分解见 [`eval_results/single_class_bonus.md`](eval_results/single_class_bonus.md)。
+2. **单类（crack）。** cls 通道=1 硬编码。**后处理 0.6ms 是单类口径**：真实 COCO 80 类对照（官方 yolov8n-seg 走同一 cut-tail + 零拷贝管线，同板同调速器）后处理 **8.5-8.8ms / 37 FPS**——单类省 ~7.9ms（≈92%），几乎全部来自 cls 收集段（8400 锚点 × 80 类 vs ×1 的固定扫描，与检出数无关）。真优化（光栅化 0.14ms、filter-first NMS≈0、零拷贝）与类数无关、对多类同样有效，80 类口径仍满足相机 30 FPS 节拍。分解见 [`eval_results/single_class_bonus.md`](eval_results/single_class_bonus.md)。
 
 3. **Mask mAP 的 4×4 光栅化折中。** C++ 实时路径用框内 4×4 块 memset（最近邻）+ 416 分辨率 IoU 换取相机实时路径的实时性，Mask mAP50 = 0.626 vs 训练机 0.666（−4.0 个百分点）。多口径接近不能单独隔离 INT8 量化的影响——分辨率、插值、评测实现均不同；这里只能观察到“同 INT8 模型在不同口径下结果接近”，更多口径对照见 [`eval_results/ALIGNMENT_NOTES.md`](eval_results/ALIGNMENT_NOTES.md)。
 

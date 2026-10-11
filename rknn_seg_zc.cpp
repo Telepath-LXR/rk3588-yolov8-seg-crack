@@ -202,13 +202,14 @@ public:
     // 暴露 proto 原生 int8 指针 + attr (供 NEON 融合路径直接用)
     const int8_t* proto_raw() const { return out_raw[9]; }
     // 读 cls 输出 (scale idx 0/1/2 → 输出 1/4/7) 融合反量化+sigmoid, 无临时分配
-    // 返回 [H*W] 的 conf
+    // 单类(Cl==1) 返回 [H*W]; 多类(Cl>1) 返回 [Cl*H*W] (c 主序, conf[c*H*W + y*W + x])
     void read_cls(int scale, std::vector<float>& conf) const {
         int oi = 3*scale + 1;
         const NativeAttr& a = out_a[oi];
-        conf.resize(a.H*a.W);
+        int Cl=a.Clogical;
+        conf.resize((Cl==1?1:Cl) * a.H*a.W);
         const int8_t* base = out_raw[oi];
-        const int C1=a.C1, H=a.H, W=a.W, C2=a.C2, Cl=a.Clogical;
+        const int C1=a.C1, H=a.H, W=a.W, C2=a.C2;
         const int HW2 = H*W*C2, W2 = W*C2;
         const float sc=a.scale; const float zp=(float)a.zp;
         float* o = conf.data();
@@ -233,6 +234,8 @@ public:
             }
         }
     }
+    // cls 输出的逻辑类数 (单类=1, COCO=80)
+    int cls_count(int scale) const { return out_a[3*scale+1].Clogical; }
     // DFL: 读 box 输出 (scale) 在 (x,y) 处的 64 个 int8, 反量化+softmax → 4 距离
     void read_dfl(int scale, int x, int y, float dist[4]) const {
         int oi = 3*scale;
@@ -305,6 +308,7 @@ private:
 struct Result {
     std::vector<std::array<float,4>> boxes;       // 原图 xyxy (按 conf 降序)
     std::vector<float> confs;
+    std::vector<int> clsids;                       // 类 id (多类时非 0; 单类恒 0)
     cv::Mat mask;                                  // 合并二值掩码 (原图尺寸)
     // —— eval 专用: 保留幸存实例的 640 框 + 32 掩码系数, 供 eval 重光栅化逐实例掩码 ——
     std::vector<std::array<float,4>> boxes640;     // 与 boxes 同序 (640 坐标系)
@@ -365,6 +369,7 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
     auto T1=Clock::now();
     std::vector<std::array<float,4>> boxes640;
     std::vector<float> confs;
+    std::vector<int> clsids;
     std::vector<std::array<float,32>> segs;
     int n_cand=0;
     const int SIM = sim_cls();   // 单类红利模拟: N>1 时把 cls 当 N 类算
@@ -373,6 +378,7 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
         std::vector<float> conf; m.read_cls(s, conf);
         const NativeAttr& ba = m.out_a[3*s];
         int H=ba.H, W=ba.W;
+        int Cl=m.cls_count(s);     // 实际类数 (单类=1, COCO=80)
         float stride = (float)IMG_SIZE / H;  // H==W
         // 单类红利模拟: 把 cls sigmoid 按 SIM 类重复算 (隔离 cls 开销随类数的增长)
         if(SIM>1){
@@ -381,18 +387,22 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
                 volatile float sink=tmp.empty()?0:tmp[0]; (void)sink;
             }
         }
-        for(int y=0;y<H;y++) for(int x=0;x<W;x++){
-            float c = conf[y*W+x];
-            if(c < conf_thr) continue;
-            n_cand++;
-            float dist[4]; m.read_dfl(s, x, y, dist);
-            float gx=x+0.5f, gy=y+0.5f;
-            float x1=(gx-dist[0])*stride, y1=(gy-dist[1])*stride;
-            float x2=(gx+dist[2])*stride, y2=(gy+dist[3])*stride;
-            boxes640.push_back({x1,y1,x2,y2});
-            confs.push_back(c);
-            std::array<float,32> sg; m.read_coeff(s, x, y, sg.data());
-            segs.push_back(sg);
+        for(int c=0;c<Cl;c++){
+            const float* cc = conf.data() + c*H*W;
+            for(int y=0;y<H;y++) for(int x=0;x<W;x++){
+                float cf = cc[y*W+x];
+                if(cf < conf_thr) continue;
+                n_cand++;
+                float dist[4]; m.read_dfl(s, x, y, dist);
+                float gx=x+0.5f, gy=y+0.5f;
+                float x1=(gx-dist[0])*stride, y1=(gy-dist[1])*stride;
+                float x2=(gx+dist[2])*stride, y2=(gy+dist[3])*stride;
+                boxes640.push_back({x1,y1,x2,y2});
+                confs.push_back(cf);
+                clsids.push_back(c);
+                std::array<float,32> sg; m.read_coeff(s, x, y, sg.data());
+                segs.push_back(sg);
+            }
         }
     }
     double t_cand=ms_since(T1);
@@ -400,7 +410,21 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
         R.n_cand=n_cand; R.t_cand=t_cand; return R; }
 
     auto T2=Clock::now();
-    std::vector<int> keep = nms(boxes640, confs, conf_thr, NMS_THRESH);
+    std::vector<int> keep;
+    // 多类 per-class NMS (真实多类) 或 单类单次 NMS; SIM 模拟多类时再重复
+    int n_cls_real = 1;
+    if(!clsids.empty()){ int mx=0; for(int c:clsids) mx=std::max(mx,c); n_cls_real=mx+1; }
+    if(n_cls_real>1){
+        // 真实多类: 对每类独立 NMS 后合并
+        for(int c=0;c<n_cls_real;c++){
+            std::vector<std::array<float,4>> bx; std::vector<float> sc; std::vector<int> map;
+            for(size_t i=0;i<clsids.size();i++) if(clsids[i]==c){ bx.push_back(boxes640[i]); sc.push_back(confs[i]); map.push_back((int)i); }
+            std::vector<int> k = nms(bx, sc, conf_thr, NMS_THRESH);
+            for(int kk: k) keep.push_back(map[kk]);
+        }
+    } else {
+        keep = nms(boxes640, confs, conf_thr, NMS_THRESH);
+    }
     // 单类红利模拟: per-class NMS 跑 SIM 趟 (C++ demo 多类是对每类各跑一次 NMS)
     if(SIM>1){
         for(int rep=0;rep<SIM-1;rep++){
@@ -489,6 +513,7 @@ static Result post_process(RknnSeg& m, int img_w, int img_h, bool dbg=false,
         auto& bb=boxes640[idx];
         R.boxes.push_back({(bb[0]-b.left)/b.r,(bb[1]-b.top)/b.r,(bb[2]-b.left)/b.r,(bb[3]-b.top)/b.r});
         R.confs.push_back(confs[idx]);
+        R.clsids.push_back(clsids[idx]);
         R.boxes640.push_back(bb);
         R.coeffs.push_back(segs[idx]);
     }
