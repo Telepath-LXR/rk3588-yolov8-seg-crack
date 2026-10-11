@@ -30,18 +30,30 @@
 
 > 平均置信度 **0.785**，处理吞吐 **60.2 FPS**（OSD 实时显示）。GIF 80 帧 / 10s / 1.9 MB。
 
-**端到端吞吐对比**（Python 基线 → C++ 零拷贝，视频文件源无相机节拍）：
+**端到端吞吐对比**（crack 单类模型；分两个口径：**视频源稀疏场景** = 原叙事口径，**200 val 密集场景** = 几乎张张有裂缝的后处理密集口径）：
 
 ![FPS 对比](demo/fps_comparison.png)
 
+**口径 A：视频文件源（稀疏场景，原叙事）**：
+
 | 阶段 | 推理 | 后处理 | 端到端 | FPS | 备注 |
 |---|---|---|---|---|---|
-| Python 参考基线（`RKNNLite`） | 24.9 ms | 9.1 ms | 34.0 ms | **29.4** | numpy↔NPU 拷贝 + 自动反量化 |
+| Python 参考基线（`RKNNLite` INT8） | 24.9 ms | 9.1 ms | 34.0 ms | **29.4** | numpy↔NPU 拷贝 + 自动反量化 |
 | C++ 零拷贝（schedutil 调速器） | ~19 ms | 0.6 ms | ~22.8 ms | **43.0** | 零拷贝 + filter-first，调速器未锁频 |
 | **C++ 零拷贝（performance 调速器）** | **15.8 ms** | **0.6 ms** | **16.3 ms** | **61.2** | 8 核锁 performance，`CORE_0` 单核，NPU 运行于 1 GHz |
 | 相机实时墙钟 | — | — | 33.3 ms | **30.0** | IMX415 ISP 硬件节拍上限（非推理瓶颈） |
 
-**2.08× 提升**（29.4 → 61.2 FPS）。NPU 推理占端到端 96.7%，软件开销 <0.6 ms，处理链路主要耗时位于 NPU 执行阶段（单核 `CORE_0`，1 GHz）。**相机实时仍 30 FPS**：这是 IMX415 硬件节拍，不是推理瓶颈——视频文件源展示的是真实处理吞吐。数据见研究报告 L303-306，如实未改。
+**口径 B：200 val 密集场景（几乎张张有裂缝，后处理密集）**：
+
+| 阶段 | 推理 | 后处理 | 端到端 | FPS | 备注 |
+|---|---|---|---|---|---|
+| Python `RKNNLite` INT8 | 29.1 ms | 34.5 ms | 63.6 ms | **15.7** | `bench_fp16.py`，密集场景 |
+| Python `RKNNLite` FP16（参考精度） | 62.1 ms | 28.3 ms | 90.5 ms | **11.1** | `bench_fp16.py`；FP16 推理为 INT8 的 ~2.1× |
+| **C++ 零拷贝 INT8（performance）** | **16.1 ms** | **0.65 ms** | **16.8 ms** | **59.5** | `rknn_seg_zc bench`，同密集场景 |
+
+> **口径说明**：口径 A 是相机/视频源的稀疏场景（候选少，后处理 0.6ms）；口径 B 是 200 val 图密集场景（几乎张张有裂缝，后处理更忙）——两者后处理不同属正常（后处理随候选数亚线性增长）。**FP16 对照**：提供参考精度但推理 62ms（约为 INT8 的 2.1×）、端到端 11.1 FPS——**FP16 在 RK3588 NPU 上比 INT8 慢且精度收益不抵速度损失，故部署用 INT8**。零拷贝 C++ 路径仅支持 INT8 原生张量，FP16 走 RKNNLite Python 路径。
+
+**2.08× 提升**（29.4 → 61.2 FPS，口径 A 稀疏场景）。NPU 推理占端到端 96.7%，软件开销 <0.6 ms，处理链路主要耗时位于 NPU 执行阶段（单核 `CORE_0`，1 GHz）。**相机实时仍 30 FPS**：这是 IMX415 硬件节拍，不是推理瓶颈——视频文件源展示的是真实处理吞吐。数据见研究报告 L303-306，如实未改。
 
 > **后处理 0.6 ms 是相机/视频源的稀疏场景均值**（候选少）；**密集场景**（200 val 图，几乎张张有裂缝）实时 conf 0.18 后处理 **mean 0.89 / p50 0.68 / p95 1.98 / max 3.13 ms**（bench 图像目录源，无相机节拍）。**eval 报告历史值"后处理 16.6 ms"是计时标签 bug**（计时起点误含 NPU run；修复后 eval 纯后处理 mean 1.59 / p95 3.37 ms），不代表实时性能——后处理随候选数亚线性增长（候选 ×3.3 → 后处理 ×1.8）。口径分解见 [`eval_results/postprocess_scaling.md`](eval_results/postprocess_scaling.md)。
 
@@ -405,6 +417,7 @@ Python 参考路径（`post_cut.py` / `eval_py.py`）对齐：`OBJ_THRESH=0.01`�
 | [`convert_cut.py`](convert_cut.py) | ONNX→RKNN INT8 转换（用 rknn2 环境！） |
 | [`export_coco_seg_cut.py`](export_coco_seg_cut.py) / [`convert_coco_seg.py`](convert_coco_seg.py) | COCO 80 类 yolov8n-seg 的导出/cut-tail/RKNN 转换（单类红利真实对照用） |
 | [`probe_zero_copy.cpp`](probe_zero_copy.cpp) | 探测 NPU 原生张量格式 |
+| [`bench_fp16.py`](bench_fp16.py) | FP16/INT8 同口径 Python bench（RKNNLite + post_cut，测 FP16 参考精度路径） |
 | [`build_zc.sh`](build_zc.sh) | 交叉编译脚本 |
 | [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 + 10 min bench/thermal 数据 + [后处理退化分解](eval_results/postprocess_scaling.md) + [单类红利量化](eval_results/single_class_bonus.md) + [负样本误检](eval_results/eval_report.md) |
 | [`demo/`](demo/) | S4 演示产物：`demo_small.gif`、`demo_imgs.mp4`、`fps_comparison.png`、`yolo_vs_seg_fps.png`、`make_fps_chart.py`、`make_compare_chart.py` |
