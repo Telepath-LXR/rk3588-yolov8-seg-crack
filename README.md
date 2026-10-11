@@ -11,6 +11,7 @@
 | **模型大小** | **4.5 MB** | INT8 cut-tail（原 ONNX 13 MB） |
 | **板端 Box mAP50** | **0.809** | 200 val 图，C++ eval 模式（conf 0.01 口径） |
 | **板端 Mask mAP50** | **0.626**（C++ 实时）/ **0.669**（160 口径 ≈ 训练机 0.666） | 不同口径对照见 [局限](#五局限与诚实声明)，非单独隔离量化影响 |
+| **板端 FP16 参考**（同 cut 模型） | Box mAP50 0.826 / Mask 0.655（vs INT8 0.807/0.654，量化对 mask 几乎无损 −0.001） | 修复 proto SiLU 后实测，[对照](eval_results/ALIGNMENT_NOTES.md) |
 | **实时工作点**（conf 0.18 部署） | Box P0.71/R0.84/F1 **0.77**；Mask P0.62/R0.74/F1 **0.67** | 200 val 图，[详表](eval_results/eval_report.md) |
 | **负样本误检**（conf 0.18） | **0.033 FP/图**（90 张无裂缝墙面，3/90 含误检；95% 置信区间 [0.7%, 9.4%]，样本量小、统计意义有限） | SDNET2018 UW，[详表](eval_results/eval_report.md) |
 | **单类红利** | 同管线 80 类后处理 8.8ms vs 单类 0.65ms（省 7.9ms，全在 cls 收集段） | 真 COCO 对照，[详表](eval_results/single_class_bonus.md) |
