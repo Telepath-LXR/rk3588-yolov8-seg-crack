@@ -13,6 +13,7 @@
 | **板端 Mask mAP50** | **0.626**（C++ 实时）/ **0.669**（160 口径 ≈ 训练机 0.666） | 不同口径对照见 [局限](#五局限与诚实声明)，非单独隔离量化影响 |
 | **实时工作点**（conf 0.18 部署） | Box P0.71/R0.84/F1 **0.77**；Mask P0.62/R0.74/F1 **0.67** | 200 val 图，[详表](eval_results/eval_report.md) |
 | **负样本误检**（conf 0.18） | **0.033 FP/图**（90 张无裂缝墙面，3/90 含误检；95% 置信区间 [0.7%, 9.4%]，样本量小、统计意义有限） | SDNET2018 UW，[详表](eval_results/eval_report.md) |
+| **单类红利** | 同管线 80 类后处理 8.8ms vs 单类 0.65ms（省 7.9ms，全在 cls 收集段） | 真 COCO 对照，[详表](eval_results/single_class_bonus.md) |
 | 训练机参考 | Box mAP50 0.833 / Mask mAP50 0.666（mAP50-95：Box 0.626 / Mask 0.219，见[训练产物](seg/results.csv)） | best.pt FP32，ultralytics val |
 
 > 详细性能归因见 [`研究报告_YOLOv8-seg_RK3588零拷贝优化.md`](研究报告_YOLOv8-seg_RK3588零拷贝优化.md)；板端精度对齐见 [`eval_results/ALIGNMENT_NOTES.md`](eval_results/ALIGNMENT_NOTES.md)。
@@ -56,6 +57,15 @@
 
 > 检测比分割快 1.20×（27.3 vs 22.7 FPS）：两者 NPU 计算相近（16.8 vs 15.4 ms），差距主要来自分割多出的掩码系数(32ch)与原型掩码(32×160×160)后处理（8.2 vs 2.9 ms）。FP16 推理为 INT8 的 0.44× 速度。三模型 NPU 均锁 1 GHz、温度峰值 ≤36.1 °C，无热降频。**非精度/性价比排名**——任务复杂度(80 类 vs 单类、有无掩码)、模型结构、量化精度三因素未单独隔离。全指标见 [`eval_results/yolo_vs_seg/对比报告.md`](eval_results/yolo_vs_seg/对比报告.md)。
 
+**单类 vs 80 类分割（真实对照，同管线同板同二进制）**：
+
+| 模型 | 任务 | NPU 推理 | 后处理 mean/p95 | 端到端 | FPS |
+|---|---|---|---|---|---|
+| YOLOv8-seg INT8（crack 自训） | 单类裂缝分割 | 16.1 ms | **0.65 / 0.87 ms** | 16.8 ms | **59.5** |
+| YOLOv8-seg INT8（COCO 官方 yolov8n-seg） | 80 类分割 | 18.3 ms | **8.82 / 9.21 ms** | 27.1 ms | **36.9** |
+
+> 同一 cut-tail + 零拷贝 C++ 管线、同板同调速器。**单类红利 ~7.9ms（92%），几乎全部来自 cls 收集段**（8400 锚点 × 80 类 vs ×1 的固定反量化+sigmoid 扫描，与检出数无关）。真优化（4×4 NEON 光栅化 0.14ms、filter-first NMS≈0、零拷贝）与类数无关、对多类同样有效；80 类口径仍 37 FPS > 相机 30 FPS 节拍。分解见 [`eval_results/single_class_bonus.md`](eval_results/single_class_bonus.md)。
+
 **延迟分布与 10 分钟热稳定性**（36000 帧持续推理，≈10 min，performance 调速器）：
 
 | 指标 | mean | p50 | p95 | p99 | max |
@@ -82,6 +92,7 @@
 - **15.8 ms** —— NPU 推理占端到端 96.7%，软件开销 <0.6 ms；在当前模型/输入/单核配置下，处理链路主要耗时位于 NPU 执行阶段。
 - **61 FPS** —— 视频文件源端到端处理吞吐（非相机实时）；相机实时 30 FPS 是 IMX415 硬件节拍上限，不是推理瓶颈。
 - **0.809 / 0.626** —— 板端 INT8 mAP，与训练机 0.833/0.666 对照（Box −2.4 个百分点；Mask 多口径接近，C++ 实时 −4.0 个百分点，归因于 4×4 光栅化，未单独隔离量化影响）。
+- **0.65 ms 后处理（单类口径）** —— 真实 COCO 80 类对照下同管线 8.8ms：单类省 7.9ms（全在 cls 收集段），真优化（光栅化 0.14ms/零拷贝/filter-first）与类数无关。见 [`eval_results/single_class_bonus.md`](eval_results/single_class_bonus.md)。
 
 ---
 
@@ -392,6 +403,7 @@ Python 参考路径（`post_cut.py` / `eval_py.py`）对齐：`OBJ_THRESH=0.01`�
 | [`post_cut.py`](post_cut.py) | numpy 后处理参考（正确性 ground truth） |
 | [`eval_py.py`](eval_py.py) | 板端 Python 双线性参考评测（隔离 4×4 光栅化影响） |
 | [`convert_cut.py`](convert_cut.py) | ONNX→RKNN INT8 转换（用 rknn2 环境！） |
+| [`export_coco_seg_cut.py`](export_coco_seg_cut.py) / [`convert_coco_seg.py`](convert_coco_seg.py) | COCO 80 类 yolov8n-seg 的导出/cut-tail/RKNN 转换（单类红利真实对照用） |
 | [`probe_zero_copy.cpp`](probe_zero_copy.cpp) | 探测 NPU 原生张量格式 |
 | [`build_zc.sh`](build_zc.sh) | 交叉编译脚本 |
 | [`eval_results/`](eval_results/) | mAP 评测报告 + 对齐说明 + 失败样例图 + 10 min bench/thermal 数据 + [后处理退化分解](eval_results/postprocess_scaling.md) + [单类红利量化](eval_results/single_class_bonus.md) + [负样本误检](eval_results/eval_report.md) |
