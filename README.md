@@ -46,7 +46,7 @@
 
 **YOLO11 检测 vs YOLOv8-seg 分割**（同口径 Python `RKNNLite` bench，300 帧）：
 
-![YOLO 检测 vs 分割 FPS](demo/yolo_vs_seg_fps.png)
+![YOLO 检测 vs 分割 FPS](demo/fps_comparison.png)
 
 ### 核心数字
 
