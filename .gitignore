@@ -103,3 +103,13 @@ yolov8n-seg.pt
 yolov8n-seg.onnx
 yolov8n-seg-coco_cut.onnx
 yolov8n_seg_coco_int8_cut.rknn
+
+# 新增临时文件
+check*.onnx
+cmp_*.png
+cut_verify.png
+probe_zero_copy
+cap.mp4
+result.jpg
+/mediamtx.yml
+data/
