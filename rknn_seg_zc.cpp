@@ -32,6 +32,8 @@
 #include <condition_variable>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <random>
+#include <tuple>
 #include <cctype>
 
 #include "rknn_api.h"
@@ -41,6 +43,23 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/videoio.hpp>
 #include <arm_neon.h>
+
+// RTSP 输入支持 (FFmpeg rkmpp 硬解 + RGA 缩放, 见 rtsp_source.h/rga_convert.h)
+// 编译时定义 WITH_RTSP 启用; build_zc.sh 默认开启.
+#ifdef WITH_RTSP
+#include "rtsp_source.h"
+#endif
+
+// RTSP 推流（把板子画面推到 PC 看），用 WITH_PUSH 控制
+#ifdef WITH_PUSH
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+}
+#endif
 
 // 16-lane int8 × float 点积 (NEON). 用于融合 proto 反量化 + 掩码内积:
 // proto 原生 NC1HWC2, C2=16 最内层 → 16 通道连续 int8, 一次 vld1 即可.
@@ -305,6 +324,137 @@ private:
 // =====================================================================
 //  后处理 (filter-first 优化)
 // =====================================================================
+#ifdef WITH_PUSH
+// RTSP 推流器：BGR cv::Mat → H.264 (rkmpp 硬编码) → RTSP
+class RtspPusher {
+public:
+    AVFormatContext* fmt_ = nullptr;
+    AVCodecContext* cc_ = nullptr;
+    AVStream* st_ = nullptr;
+    AVFrame* frame_ = nullptr;
+    SwsContext* sws_ = nullptr;
+    AVPacket* pkt_ = nullptr;
+    int w_ = 0, h_ = 0, pts_ = 0;
+    bool ok_ = false;
+
+    bool init(int width, int height, const std::string& url) {
+        w_ = (width + 1) & ~1;
+        h_ = (height + 1) & ~1;
+
+        if (avformat_alloc_output_context2(&fmt_, nullptr, "rtsp", url.c_str()) < 0) {
+            fprintf(stderr, "[push] alloc_output_context fail\n");
+            return false;
+        }
+
+        const AVCodec* codec = avcodec_find_encoder_by_name("h264_rkmpp");
+        if (!codec) {
+            fprintf(stderr, "[push] h264_rkmpp not found, fallback libx264\n");
+            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        }
+        if (!codec) {
+            fprintf(stderr, "[push] no H.264 encoder\n");
+            return false;
+        }
+
+        st_ = avformat_new_stream(fmt_, nullptr);
+        cc_ = avcodec_alloc_context3(codec);
+        cc_->width = w_;
+        cc_->height = h_;
+        cc_->time_base = {1, 25};
+        cc_->framerate = {25, 1};
+        cc_->pix_fmt = AV_PIX_FMT_NV12;
+        cc_->bit_rate = 3000000;
+        cc_->gop_size = 5;
+        cc_->max_b_frames = 0;
+
+        av_opt_set(cc_->priv_data, "tune", "zerolatency", 0);
+        av_opt_set(cc_->priv_data, "preset", "ultrafast", 0);
+        av_opt_set_int(cc_->priv_data, "rc_lookahead", 0, 0);
+        av_opt_set_int(cc_->priv_data, "sync_lookahead", 0, 0);
+        cc_->thread_count = 1;
+
+        if (fmt_->oformat->flags & AVFMT_GLOBALHEADER)
+            cc_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        if (avcodec_open2(cc_, codec, nullptr) < 0) {
+            fprintf(stderr, "[push] avcodec_open2 fail\n");
+            return false;
+        }
+
+        avcodec_parameters_from_context(st_->codecpar, cc_);
+        st_->time_base = cc_->time_base;
+
+        if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
+            if (avio_open(&fmt_->pb, url.c_str(), AVIO_FLAG_WRITE) < 0) {
+                fprintf(stderr, "[push] avio_open fail: %s\n", url.c_str());
+                return false;
+            }
+        }
+
+        if (avformat_write_header(fmt_, nullptr) < 0) {
+            fprintf(stderr, "[push] write_header fail\n");
+            return false;
+        }
+
+        frame_ = av_frame_alloc();
+        frame_->format = AV_PIX_FMT_NV12;
+        frame_->width = w_;
+        frame_->height = h_;
+        if (av_frame_get_buffer(frame_, 32) < 0) return false;
+
+        sws_ = sws_getContext(w_, h_, AV_PIX_FMT_BGR24,
+                              w_, h_, AV_PIX_FMT_NV12,
+                              SWS_BILINEAR, nullptr, nullptr, nullptr);
+        pkt_ = av_packet_alloc();
+        ok_ = true;
+        fprintf(stderr, "[push] RTSP ready: %dx%d -> %s (encoder=%s)\n",
+                w_, h_, url.c_str(), codec->name);
+        return true;
+    }
+
+    void push(const cv::Mat& bgr) {
+        if (!ok_ || bgr.empty()) return;
+        cv::Mat img = bgr;
+        if (img.cols != w_ || img.rows != h_)
+            cv::resize(img, img, cv::Size(w_, h_));
+
+        av_frame_make_writable(frame_);
+        const uint8_t* src[1] = { img.data };
+        int src_linesize[1] = { (int)img.step };
+        sws_scale(sws_, src, src_linesize, 0, h_, frame_->data, frame_->linesize);
+        frame_->pts = pts_++;
+
+        if (avcodec_send_frame(cc_, frame_) < 0) return;
+        while (avcodec_receive_packet(cc_, pkt_) == 0) {
+            pkt_->stream_index = st_->index;
+            av_packet_rescale_ts(pkt_, cc_->time_base, st_->time_base);
+            av_interleaved_write_frame(fmt_, pkt_);
+            av_packet_unref(pkt_);
+        }
+    }
+
+    void close() {
+        if (!ok_) return;
+        avcodec_send_frame(cc_, nullptr);
+        while (avcodec_receive_packet(cc_, pkt_) == 0) {
+            av_interleaved_write_frame(fmt_, pkt_);
+            av_packet_unref(pkt_);
+        }
+        av_write_trailer(fmt_);
+        if (sws_) sws_freeContext(sws_);
+        if (frame_) av_frame_free(&frame_);
+        if (pkt_) av_packet_free(&pkt_);
+        if (cc_) avcodec_free_context(&cc_);
+        if (fmt_) {
+            if (!(fmt_->oformat->flags & AVFMT_NOFILE) && fmt_->pb)
+                avio_closep(&fmt_->pb);
+            avformat_free_context(fmt_);
+        }
+        ok_ = false;
+    }
+};
+#endif
+
 struct Result {
     std::vector<std::array<float,4>> boxes;       // 原图 xyxy (按 conf 降序)
     std::vector<float> confs;
@@ -317,6 +467,57 @@ struct Result {
     int n_cand=0, n_keep=0, n_mask=0;              // 候选数 / NMS 后 / 实际光栅化掩码数
     double t_cand=0, t_nms=0, t_gemm_raster=0, t_final=0;  // 分段 ms
 };
+// 端侧灰区采样：与 cloud/live_spool.py 同口径
+static bool cloud_sample(const cv::Mat& frame,
+                          float x1f, float y1f, float x2f, float y2f,
+                          float conf, int frame_id,
+                          const std::string& outbox_dir) {
+    static std::vector<std::tuple<int,int,int64_t>> recent;
+    static std::mt19937 rng(std::random_device{}());
+    int x1=(int)x1f, y1=(int)y1f, x2=(int)x2f, y2=(int)y2f;
+    int w = x2-x1, h = y2-y1;
+    if (w <= 0 || h <= 0) return false;
+    int cx = (x1+x2)/2, cy = (y1+y2)/2;
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    for (auto& d : recent) {
+        if (now_ms - std::get<2>(d) < 30000 &&
+            std::abs(std::get<0>(d) - cx) < 50 &&
+            std::abs(std::get<1>(d) - cy) < 20) return false;
+    }
+    recent.push_back({cx, cy, now_ms});
+    if (recent.size() > 64) recent.erase(recent.begin());
+    int rx1 = std::max(0, x1 - (int)(w*0.3));
+    int ry1 = std::max(0, y1 - (int)(h*0.3));
+    int rx2 = std::min(frame.cols, x2 + (int)(w*0.3));
+    int ry2 = std::min(frame.rows, y2 + (int)(h*0.3));
+    if (rx2 <= rx1 || ry2 <= ry1) return false;
+    cv::Mat crop = frame(cv::Rect(rx1, ry1, rx2-rx1, ry2-ry1)).clone();
+    double scale = 512.0 / std::max(crop.cols, crop.rows);
+    if (scale < 1.0) cv::resize(crop, crop, cv::Size(), scale, scale, cv::INTER_AREA);
+    int ts_ms = (int)now_ms + (int)(rng() % 1000);
+    char event_name[64];
+    std::snprintf(event_name, sizeof(event_name), "%d_%d", ts_ms, frame_id);
+    std::string tmp_dir   = outbox_dir + "/." + event_name + ".tmp";
+    std::string final_dir = outbox_dir + "/" + event_name;
+    mkdir(tmp_dir.c_str(), 0775);
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+    cv::imwrite(tmp_dir + "/crop.jpg", crop, params);
+    std::ofstream mf(tmp_dir + "/meta.json");
+    mf << "{\n";
+    mf << " \"conf\": " << conf << ",\n";
+    mf << " \"bbox\": [" << x1 << "," << y1 << "," << x2 << "," << y2 << "],\n";
+    mf << " \"frame_id\": " << frame_id << ",\n";
+    mf << " \"source\": \"rtsp-cpp\",\n";
+    mf << " \"model_version\": \"yolov8n-seg-int8-cut\",\n";
+    mf << " \"mono_ms\": " << ts_ms << ",\n";
+    mf << " \"ts\": " << (now_ms / 1000.0) << "\n";
+    mf << "}\n";
+    mf.close();
+    rename(tmp_dir.c_str(), final_dir.c_str());
+    return true;
+}
+
 struct LB { float r; int left, top, nu_w, nu_h; };
 static LB lb_params(int oh, int ow, int ns=IMG_SIZE){
     LB b; b.r=std::min((float)ns/oh,(float)ns/ow);
@@ -560,7 +761,8 @@ static int mode_image(RknnSeg& m, const std::string& img_path){
     int H=frame.rows,W=frame.cols;
     cv::Mat img640 = letterbox(frame.clone());
     double t_run = m.run(img640);
-    auto tp=Clock::now(); Result R=post_process(m,W,H,true); double post_ms=ms_since(tp);
+    auto tp=Clock::now(); Result R=post_process(m,W,H,true);
+ double post_ms=ms_since(tp);
     cv::Mat out = draw(frame,R); cv::imwrite("zc_out.png",out);
     printf("==== 零拷贝 + C++ 后处理 (单图) ====\n");
     printf("图像: %s  %dx%d\n",img_path.c_str(),W,H);
@@ -581,17 +783,39 @@ static int mode_image(RknnSeg& m, const std::string& img_path){
 
 static int mode_cam(RknnSeg& m, const std::string& src){
     bool use_cam = src.find("/dev/video")==0 || src.find('.')==std::string::npos;
-    cv::VideoCapture cap; if(use_cam) cap.open(src,cv::CAP_V4L2); else cap.open(src);
-    if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
+    bool is_rtsp = src.rfind("rtsp://",0)==0 || src.rfind("rtsps://",0)==0;
+    if(is_rtsp) use_cam=false;
+    cv::VideoCapture cap;
+#ifdef WITH_RTSP
+    RtspSource rtsp;
+#endif
+    if(is_rtsp){
+#ifdef WITH_RTSP
+        if(!rtsp.open(src)){ fprintf(stderr,"cam: RTSP open fail: %s\n",src.c_str()); return 1; }
+#else
+        fprintf(stderr,"cam: RTSP 未编译 (重编译加 WITH_RTSP)\n"); return 1;
+#endif
+    } else {
+        if(use_cam) cap.open(src,cv::CAP_V4L2); else cap.open(src);
+        if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
+    }
     int sw,sh; get_screen(sw,sh);
     const std::string WIN="crack_seg_zc";
     cv::namedWindow(WIN,cv::WINDOW_NORMAL);
     cv::setWindowProperty(WIN,cv::WND_PROP_FULLSCREEN,cv::WINDOW_FULLSCREEN);
 
+#ifdef WITH_PUSH
+    RtspPusher pusher;
+    const char* push_url = getenv("PUSH_URL");
+    if (!push_url) push_url = "rtsp://127.0.0.1:8554/live";
+    bool push_ok = pusher.init(640, 360, push_url);
+#else
+    bool push_ok = false;
+#endif
+
     // ---- 异步采集流水线: 采集线程预读下一帧, 与当前帧推理+显示并行 ----
-    // 串行: cap.read(33ms)+推理(16ms)+显示(~10ms)≈60ms→~17FPS
-    // 流水线: wall→max(33, 16+10)=33ms→~30FPS (相机节拍上限)
-    bool async_cap = use_cam;
+    // 相机固定 30FPS / RTSP 网络流, 处理仅 ~16ms → 流水线隐藏采集延迟
+    bool async_cap = use_cam || is_rtsp;
     std::thread cap_thread;
     std::mutex cap_mtx;
     std::condition_variable cap_cv;
@@ -600,7 +824,12 @@ static int mode_cam(RknnSeg& m, const std::string& src){
     auto capture_loop = [&](){
         cv::Mat f;
         while(true){
-            if(!cap.read(f)||f.empty()){
+#ifdef WITH_RTSP
+            bool ok = is_rtsp ? rtsp.read(f) : (cap.read(f) && !f.empty());
+#else
+            bool ok = cap.read(f) && !f.empty();
+#endif
+            if(!ok){
                 std::lock_guard<std::mutex> lk(cap_mtx);
                 cap_fail=true; cap_cv.notify_one(); return;
             }
@@ -628,22 +857,50 @@ static int mode_cam(RknnSeg& m, const std::string& src){
             if(!cap.read(f)||f.empty()){ if(!use_cam){cap.set(cv::CAP_PROP_POS_FRAMES,0);continue;} break; }
         }
         int H=f.rows,W=f.cols; cv::Mat img640=letterbox(f.clone());
-        auto t0=Clock::now(); double r=m.run(img640); Result R=post_process(m,W,H,true); double e=ms_since(t0);
+        auto t0=Clock::now(); double r=m.run(img640); Result R=post_process(m,W,H,true);
+        {
+            static int g_cloud_fid = 0;
+            const char* OUTBOX = "/yolo8/cloud/spool/outbox";
+            mkdir(OUTBOX, 0775);
+            for (size_t i = 0; i < R.confs.size(); i++) {
+                float c = R.confs[i];
+                if (c >= 0.25f && c < 0.45f) {
+                    cloud_sample(f, R.boxes[i][0], R.boxes[i][1],
+                                    R.boxes[i][2], R.boxes[i][3],
+                                    c, g_cloud_fid, OUTBOX);
+                }
+            }
+            g_cloud_fid++;
+        } double e=ms_since(t0);
         run_ms.push_back(r); post_ms.push_back(e-r); e2e_ms.push_back(e); frames++;
         if(!R.confs.empty()){det_frames++; sum_conf+=R.confs[0]; sum_mask+=(R.mask.empty()?0:cv::countNonZero(R.mask));}
-        cv::Mat anno=draw(f,R); cv::Mat show=fit_screen(anno,sw,sh);
+        cv::Mat anno=draw(f,R);
+        cv::Mat anno_crop = anno;
+        if (is_rtsp && anno.rows == 640 && anno.cols == 640) {
+            anno_crop = anno(cv::Rect(0, 140, 640, 360));
+        }
+        cv::Mat show=fit_screen(anno_crop,sw,sh);
         float fps=e>0?1000.0f/(float)e:0;
         char osd[160];
         std::snprintf(osd,160,"[ZC] run %.0fms post %.0fms  %.1fFPS  %s",r,e-r,fps,
             R.confs.empty()?"no detect":(std::string(std::to_string(R.confs.size())+" obj mask="+std::to_string(R.mask.empty()?0:(int)cv::countNonZero(R.mask))).c_str()));
         cv::putText(show,osd,cv::Point(20,40),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,255),2);
         cv::imshow(WIN,show);
+#ifdef WITH_PUSH
+        if (push_ok) pusher.push(show);
+#endif
         double wall=ms_since(tw0);
         wall_ms.push_back(wall);
         int key=cv::waitKey(1)&0xFF; if(key=='q'||key==27) break;
     }
     if(async_cap){ { std::lock_guard<std::mutex> lk(cap_mtx); cap_stop=true; cap_cv.notify_all(); } if(cap_thread.joinable()) cap_thread.join(); }
     cap.release(); cv::destroyAllWindows();
+#ifdef WITH_RTSP
+    if(is_rtsp) rtsp.close();
+#endif
+#ifdef WITH_PUSH
+    if (push_ok) pusher.close();
+#endif
     auto st=[&](std::vector<double>&v){double s=0;for(double x:v)s+=x;return v.empty()?0.0:s/v.size();};
     auto p95=[&](std::vector<double>&v){auto a=v;std::sort(a.begin(),a.end());return a[(int)(a.size()*0.95)];};
     printf("\n==== 零拷贝实时总结 (%d 帧) ====\n",frames);
@@ -657,10 +914,14 @@ static int mode_cam(RknnSeg& m, const std::string& src){
 
 static int mode_bench(RknnSeg& m, const std::string& src, int N){
     bool use_cam = src.find("/dev/video")==0;
+    bool is_rtsp = src.rfind("rtsp://",0)==0 || src.rfind("rtsps://",0)==0;
     // 图像目录源: 逐张读, 用于密集场景后处理 P95 (避开相机节拍/视频解码)
     bool is_dir=false; { DIR* d=opendir(src.c_str()); if(d){closedir(d); is_dir=true;} }
     std::vector<std::string> dir_imgs;
     cv::VideoCapture cap;
+#ifdef WITH_RTSP
+    RtspSource rtsp;
+#endif
     if(is_dir){
         DIR* d=opendir(src.c_str()); struct dirent* ent;
         while((ent=readdir(d))!=nullptr){ std::string nm=ent->d_name;
@@ -669,18 +930,23 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
         closedir(d); std::sort(dir_imgs.begin(),dir_imgs.end());
         if(dir_imgs.empty()){ fprintf(stderr,"bench: 目录无图像 %s\n",src.c_str()); return 1; }
         if(N<=0 || N>(int)dir_imgs.size()) N=(int)dir_imgs.size();
+    } else if(is_rtsp){
+#ifdef WITH_RTSP
+        if(!rtsp.open(src)){ fprintf(stderr,"bench: RTSP open fail: %s\n",src.c_str()); return 1; }
+#else
+        fprintf(stderr,"bench: RTSP 未编译 (重编译加 WITH_RTSP)\n"); return 1;
+#endif
     } else {
         if(src.find('.')==std::string::npos) use_cam=true;   // 无扩展名视作相机节点
         if(use_cam) cap.open(src,cv::CAP_V4L2); else cap.open(src);
         if(!cap.isOpened()){ fprintf(stderr,"open source fail: %s\n",src.c_str()); return 1; }
     }
     cv::Mat wf;
-    if(!is_dir) for(int i=0;i<5;i++){ cap.read(wf); if(!wf.empty()) m.run(letterbox(wf.clone())); }
+    if(!is_dir && !is_rtsp) for(int i=0;i<5;i++){ cap.read(wf); if(!wf.empty()) m.run(letterbox(wf.clone())); }
 
-    // ---- 异步采集流水线 (仅对相机生效): 采集线程预读下一帧, 与当前帧推理并行 ----
-    // 相机固定 30FPS (cap.read 阻塞 ~33.3ms), 处理仅 ~16.3ms → 每帧有 ~17ms 空闲可隐藏
-    // 流水线后 wall 应逼近 max(33.3, 16.3)=33.3ms (相机节拍), 但处理不再串到其后
-    bool async_cap = use_cam;
+    // ---- 异步采集流水线 (相机 + RTSP 流都生效): 采集线程预读下一帧, 与当前帧推理并行 ----
+    // 相机固定 30FPS (cap.read 阻塞 ~33.3ms), RTSP 是网络流, 处理仅 ~16.3ms → 流水线隐藏采集延迟
+    bool async_cap = use_cam || is_rtsp;
     std::thread cap_thread;
     std::mutex cap_mtx;
     std::condition_variable cap_cv;
@@ -689,8 +955,13 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
     auto capture_loop = [&](){
         cv::Mat f;
         while(true){
-            // cap.read 阻塞在相机节拍 (~33.3ms/帧 @ 30FPS), 与主线程推理并行
-            if(!cap.read(f)||f.empty()){
+            // 相机 cap.read / RTSP rtsp.read 都是阻塞读, 与主线程推理并行
+#ifdef WITH_RTSP
+            bool ok = is_rtsp ? rtsp.read(f) : (cap.read(f) && !f.empty());
+#else
+            bool ok = cap.read(f) && !f.empty();
+#endif
+            if(!ok){
                 std::lock_guard<std::mutex> lk(cap_mtx);
                 cap_fail=true; cap_cv.notify_one(); return;
             }
@@ -748,6 +1019,9 @@ static int mode_bench(RknnSeg& m, const std::string& src, int N){
     if(scale_csv){ scale_csv.close(); printf("后处理分解 CSV 已写: %s\n", getenv("POST_SCALE_CSV")); }
     if(async_cap){ { std::lock_guard<std::mutex> lk(cap_mtx); cap_stop=true; cap_cv.notify_all(); } if(cap_thread.joinable()) cap_thread.join(); }
     cap.release();
+#ifdef WITH_RTSP
+    if(is_rtsp) rtsp.close();
+#endif
     auto st=[&](std::vector<double>&v){double s=0;for(double x:v)s+=x;return v.empty()?0.0:s/v.size();};
     auto p50=[&](std::vector<double>&v){auto a=v;std::sort(a.begin(),a.end());return a[a.size()/2];};
     auto p95=[&](std::vector<double>&v){auto a=v;std::sort(a.begin(),a.end());return a[(int)(a.size()*0.95)];};
